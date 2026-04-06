@@ -1,4 +1,4 @@
-import type { AnimationClip, BoneInterpolation, BoneKeyframe, Model } from "reze-engine"
+import type { AnimationClip, BoneInterpolation, BoneKeyframe, MorphKeyframe, Model } from "reze-engine"
 import { Quat, Vec3 } from "reze-engine"
 
 /** Default VMD-style linear-ish handles (127-space). */
@@ -67,6 +67,22 @@ export function upsertBoneKeyframeAtFrame(
   const boneTracks = new Map(clip.boneTracks)
   boneTracks.set(bone, nextTrack)
   return { ...clip, boneTracks }
+}
+
+/** Add or replace a morph keyframe at `frame`. */
+export function upsertMorphKeyframeAtFrame(
+  clip: AnimationClip,
+  morphName: string,
+  frame: number,
+  weight: number,
+): AnimationClip {
+  const prevTrack = clip.morphTracks.get(morphName) ?? []
+  const nextTrack = prevTrack.filter((k) => k.frame !== frame)
+  nextTrack.push({ morphName, frame, weight })
+  nextTrack.sort((a, b) => a.frame - b.frame)
+  const morphTracks = new Map(clip.morphTracks)
+  morphTracks.set(morphName, nextTrack)
+  return { ...clip, morphTracks }
 }
 
 // Engine does not expose local pose yet; after `seek` this matches the drawn skeleton.

@@ -271,12 +271,12 @@ export const EditorLeftPanel = memo(function EditorLeftPanel({
             onSelectBone={onSelectBone}
           />
         </div>
-        <div className="flex max-h-[168px] shrink-0 flex-col border-t border-border">
+        <div className="flex max-h-[196px] shrink-0 flex-col border-t border-border">
           <div className="shrink-0 px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
             Morphs
           </div>
           <div className="min-h-0 flex-1 overflow-hidden">
-            <MorphList morphNames={morphNames} activeMorph={activeMorph} onSelectMorph={onSelectMorph} />
+            <MorphList morphNames={morphNames} clip={clip} activeMorph={activeMorph} onSelectMorph={onSelectMorph} />
           </div>
         </div>
       </div>

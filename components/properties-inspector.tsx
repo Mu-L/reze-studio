@@ -17,6 +17,7 @@ import {
   cloneBoneInterpolation,
   readLocalPoseAfterSeek,
   upsertBoneKeyframeAtFrame,
+  upsertMorphKeyframeAtFrame,
   VMD_LINEAR_DEFAULT_IP,
 } from "@/lib/keyframe-insert"
 import { AxisSliderRow } from "@/components/axis-slider-row"
@@ -134,7 +135,7 @@ export const PropertiesInspector = memo(function PropertiesInspector({
   const multiSel = selectedKeyframes.length > 1
 
   const canDelete = clip && singleSel !== null
-  const canInsert = !!(clip && activeBone && !activeMorph)
+  const canInsert = !!(clip && (activeBone || activeMorph))
 
   const [ipTab, setIpTab] = useState<IpTab>("rot")
 
@@ -237,6 +238,16 @@ export const PropertiesInspector = memo(function PropertiesInspector({
       }
     },
     [activeBone, clip, currentFrame, setClip],
+  )
+
+  const setMorphWeightAtFrame = useCallback(
+    (w: number) => {
+      if (!activeMorph || !clip) return
+      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
+      setClip(upsertMorphKeyframeAtFrame(clip, activeMorph, frame, w))
+      setTimelineTab("morph")
+    },
+    [activeMorph, clip, currentFrame, setClip, setTimelineTab],
   )
 
   return (
@@ -373,12 +384,27 @@ export const PropertiesInspector = memo(function PropertiesInspector({
       ) : null}
 
       {activeMorph && clip && !multiSel ? (
-        <section className="space-y-2.5 border-b border-border pb-3">
-          <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Playhead · morph</div>
-          <div className="font-mono text-[11px] text-primary">{activeMorph}</div>
-          <div className="font-mono tabular-nums text-[11px] text-inherit">
-            {morphWeight !== null ? morphWeight.toFixed(2) : "—"}
+        <section className="border-b border-border pb-3">
+          <div className="mb-2 flex items-start justify-between gap-2">
+            <div>
+              <div className="text-xs font-semibold text-inherit">{activeMorph}</div>
+            </div>
+            <div className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+              F {fPlay}
+              {clip ? ` / ${clip.frameCount}` : ""}
+            </div>
           </div>
+          <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Weight</div>
+          <AxisSliderRow
+            axis="W"
+            color="#c084fc"
+            value={morphWeight ?? 0}
+            min={0}
+            max={1}
+            decimals={2}
+            disabled={!clip}
+            onChange={setMorphWeightAtFrame}
+          />
         </section>
       ) : null}
 

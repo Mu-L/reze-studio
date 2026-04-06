@@ -17,7 +17,7 @@ Web-native MMD animation editor in the browser (WebGPU).
 - [x] Keyboard shortcuts (Space, Arrow keys, Home/End)
 - [x] Session persistence (IndexedDB for animation data, localStorage for editor state)
 - [x] Rotation / translation sliders with direct numeric input
-- [ ] Morph weight keyframing
+- [x] Morph weight keyframing
 - [ ] Animation layers with blend weights and bone masks
 - [ ] Custom bone groups with mute / solo toggle
 - [ ] Clip operations: cut, copy, paste, mirrored paste (左↔右), import, time stretch

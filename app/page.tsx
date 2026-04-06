@@ -15,7 +15,7 @@ import { EditorLeftPanel, EditorStatusFooter, EditorViewport } from "@/component
 import { PropertiesInspector } from "@/components/properties-inspector"
 import { Timeline, type SelectedKeyframe } from "@/components/timeline"
 import { BONE_GROUPS, quatToEuler } from "@/lib/animation"
-import { interpolationTemplateForFrame, readLocalPoseAfterSeek } from "@/lib/keyframe-insert"
+import { interpolationTemplateForFrame, readLocalPoseAfterSeek, upsertMorphKeyframeAtFrame } from "@/lib/keyframe-insert"
 import type { AnimationClip, BoneKeyframe, MorphKeyframe } from "reze-engine"
 import {
   saveMeta,
@@ -355,12 +355,14 @@ export default function Home() {
     setActiveMorph(null)
     setActiveBone(b)
     setSelectedKeyframes([])
+    setTimelineTab((prev) => (prev === "morph" ? "allRot" : prev))
   }, [])
 
   const handleSelectMorph = useCallback((name: string) => {
     setActiveBone(null)
     setActiveMorph(name)
     setSelectedKeyframes([])
+    setTimelineTab("morph")
   }, [])
 
   useEffect(() => {
@@ -542,45 +544,74 @@ export default function Home() {
     setCurrentFrame((c) => Math.min(c, frameCount))
   }, [frameCount])
 
-  // Timeline key click: jump playhead; curve keys also focus the bone on the list
+  // Timeline key click: jump playhead; curve keys also focus the bone/morph on the list
   // and auto-switch the timeline channel tab to match the selected channel.
   useEffect(() => {
     if (selectedKeyframes.length !== 1) return
     const s = selectedKeyframes[0]
-    setActiveMorph(null)
-    if (s.type === "curve" && s.bone) setActiveBone(s.bone)
-    setCurrentFrame(s.frame)
-    if (s.channel && ["rx", "ry", "rz", "tx", "ty", "tz"].includes(s.channel)) {
-      setTimelineTab(s.channel)
+    if (s.morph) {
+      setActiveBone(null)
+      setActiveMorph(s.morph)
+      setTimelineTab("morph")
+    } else {
+      setActiveMorph(null)
+      if (s.type === "curve" && s.bone) setActiveBone(s.bone)
+      if (s.channel && ["rx", "ry", "rz", "tx", "ty", "tz"].includes(s.channel)) {
+        setTimelineTab(s.channel)
+      }
     }
+    setCurrentFrame(s.frame)
   }, [selectedKeyframes])
 
   const deleteSelectedKeyframes = useCallback(() => {
     if (!clip || selectedKeyframes.length !== 1) return
     const sel = selectedKeyframes[0]
-    if (sel.type === "curve" && sel.bone) {
+    if (sel.type === "curve" && sel.morph) {
+      const track = clip.morphTracks.get(sel.morph)
+      if (!track) return
+      const i = track.findIndex((k) => k.frame === sel.frame)
+      if (i < 0) return
+      track.splice(i, 1)
+      if (track.length === 0) clip.morphTracks.delete(sel.morph)
+      setSelectedKeyframes([])
+      setClip({ ...clip, morphTracks: new Map(clip.morphTracks) })
+    } else if (sel.type === "curve" && sel.bone) {
       const track = clip.boneTracks.get(sel.bone)
       if (!track) return
       const i = track.findIndex((k) => k.frame === sel.frame)
       if (i < 0) return
       track.splice(i, 1)
       if (track.length === 0) clip.boneTracks.delete(sel.bone)
+      setSelectedKeyframes([])
+      setClip({ ...clip, boneTracks: new Map(clip.boneTracks) })
     } else if (sel.type === "dope") {
       const f = sel.frame
-      const dropBones: string[] = []
-      for (const [name, track] of clip.boneTracks.entries()) {
-        const i = track.findIndex((k) => k.frame === f)
-        if (i >= 0) {
-          track.splice(i, 1)
-          if (track.length === 0) dropBones.push(name)
+      if (timelineTab === "morph" && activeMorph) {
+        const track = clip.morphTracks.get(activeMorph)
+        if (track) {
+          const i = track.findIndex((k) => k.frame === f)
+          if (i >= 0) {
+            track.splice(i, 1)
+            if (track.length === 0) clip.morphTracks.delete(activeMorph)
+          }
         }
+        setSelectedKeyframes([])
+        setClip({ ...clip, morphTracks: new Map(clip.morphTracks) })
+      } else {
+        const dropBones: string[] = []
+        for (const [name, track] of clip.boneTracks.entries()) {
+          const i = track.findIndex((k) => k.frame === f)
+          if (i >= 0) {
+            track.splice(i, 1)
+            if (track.length === 0) dropBones.push(name)
+          }
+        }
+        for (const name of dropBones) clip.boneTracks.delete(name)
+        setSelectedKeyframes([])
+        setClip({ ...clip, boneTracks: new Map(clip.boneTracks) })
       }
-      for (const name of dropBones) clip.boneTracks.delete(name)
-    } else return
-
-    setSelectedKeyframes([])
-    setClip({ ...clip, boneTracks: new Map(clip.boneTracks) })
-  }, [clip, selectedKeyframes])
+    }
+  }, [clip, selectedKeyframes, timelineTab, activeMorph])
 
   const livePose = useMemo(() => {
     const model = modelRef.current
@@ -608,8 +639,17 @@ export default function Home() {
 
   const insertKeyframeAtPlayhead = useCallback(() => {
     const model = modelRef.current
-    if (!clip || !activeBone || activeMorph || !model) return
+    if (!clip || !model) return
     const frame = Math.round(Math.max(0, currentFrame))
+
+    if (activeMorph && !activeBone) {
+      const w = morphWeightReadout ?? 0
+      setClip(upsertMorphKeyframeAtFrame(clip, activeMorph, frame, w))
+      setSelectedKeyframes([{ type: "curve", morph: activeMorph, frame }])
+      return
+    }
+
+    if (!activeBone) return
     model.loadClip(STUDIO_ANIM_NAME, clip)
     model.seek(Math.max(0, currentFrame) / 30)
     const pose = readLocalPoseAfterSeek(model, activeBone)
@@ -629,9 +669,8 @@ export default function Home() {
     const boneTracks = new Map(clip.boneTracks)
     boneTracks.set(activeBone, nextTrack)
     setClip({ ...clip, boneTracks })
-    // Focus properties (sliders + curves) like selecting a key on the graph
     setSelectedKeyframes([{ type: "curve", bone: activeBone, frame, channel: "rx" }])
-  }, [clip, activeBone, activeMorph, currentFrame])
+  }, [clip, activeBone, activeMorph, currentFrame, morphWeightReadout])
 
   const syncStudioAfterNewClip = useCallback((model: Model) => {
     setCurrentFrame(0)
@@ -902,6 +941,7 @@ export default function Home() {
               visibleBones={visibleBones}
               selectedKeyframes={selectedKeyframes}
               setSelectedKeyframes={setSelectedKeyframes}
+              activeMorph={activeMorph}
               clipVersion={clipVersion}
               tab={timelineTab}
               setTab={setTimelineTab}
