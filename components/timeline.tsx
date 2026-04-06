@@ -1,6 +1,15 @@
 "use client"
 
-import { useState, useRef, useEffect, useCallback, useMemo, memo } from "react"
+import {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+  memo,
+  type Dispatch,
+  type SetStateAction,
+} from "react"
 import {
   ChevronLeft,
   ChevronRight,
@@ -13,10 +22,9 @@ import {
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import type { AnimationClip, BoneKeyframe } from "reze-engine"
 import {
   type Channel,
-  type AnimationClip,
-  type BoneKeyframe,
   ROT_CHANNELS,
   TRA_CHANNELS,
   boneDisplayLabel,
@@ -97,6 +105,10 @@ const C = {
 } as const
 
 const FONT = "'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',monospace"
+
+function padFrame4(n: number) {
+  return String(Math.max(0, Math.round(n))).padStart(4, "0")
+}
 
 const ALL_CHANNELS: Channel[] = [...ROT_CHANNELS, ...TRA_CHANNELS]
 
@@ -889,6 +901,7 @@ function TimelineCanvas({
 // ─── Timeline (public component) ─────────────────────────────────────────
 interface TimelineProps {
   clip: AnimationClip | null
+  setClip: Dispatch<SetStateAction<AnimationClip | null>>
   currentFrame: number
   setCurrentFrame: (f: number | ((p: number) => number)) => void
   playing: boolean
@@ -901,6 +914,7 @@ interface TimelineProps {
 
 export const Timeline = memo(function Timeline({
   clip,
+  setClip,
   currentFrame,
   setCurrentFrame,
   playing,
@@ -911,6 +925,7 @@ export const Timeline = memo(function Timeline({
   setSelectedKeyframes,
 }: TimelineProps) {
   const fc = clip?.frameCount ?? 0
+  const [endDraft, setEndDraft] = useState<string | null>(null)
   const [pxPerFrame, setPxPerFrame] = useState(4)
   const pxRef = useRef(pxPerFrame)
   pxRef.current = pxPerFrame
@@ -1007,7 +1022,7 @@ export const Timeline = memo(function Timeline({
   const onMoveDopeKeyframe = useCallback(
     (from: number, to: number) => {
       if (!clip) return
-      const clamped = Math.max(0, Math.min(clip.frameCount, to))
+      const clamped = Math.max(0, to)
       if (clamped === from) return
       const bones = activeBone ? [activeBone] : visibleBones
       for (const name of bones) {
@@ -1020,9 +1035,10 @@ export const Timeline = memo(function Timeline({
       setSelectedKeyframes((prev) =>
         prev.map((s) => (s.frame === from && s.type === "dope" ? { ...s, frame: clamped } : s)),
       )
+      setClip((c) => (c ? { ...c, boneTracks: new Map(c.boneTracks) } : null))
       forceRedraw((n) => n + 1)
     },
-    [clip, activeBone, visibleBones, setSelectedKeyframes],
+    [clip, activeBone, visibleBones, setSelectedKeyframes, setClip],
   )
 
   const onMoveCurveKeyframe = useCallback(
@@ -1030,7 +1046,7 @@ export const Timeline = memo(function Timeline({
       if (!clip) return
       const track = clip.boneTracks.get(bone)
       if (!track) return
-      const clamped = Math.max(0, Math.min(clip.frameCount, toFrame))
+      const clamped = Math.max(0, toFrame)
       const kf = track.find((k: BoneKeyframe) => k.frame === from)
       if (!kf) return
       if (clamped !== from) {
@@ -1047,9 +1063,10 @@ export const Timeline = memo(function Timeline({
       setSelectedKeyframes((prev) =>
         prev.map((s) => (s.bone === bone && s.frame === from && s.channel === chKey ? { ...s, frame: clamped } : s)),
       )
+      setClip((c) => (c ? { ...c, boneTracks: new Map(c.boneTracks) } : null))
       forceRedraw((n) => n + 1)
     },
-    [clip, setSelectedKeyframes],
+    [clip, setSelectedKeyframes, setClip],
   )
 
   return (
@@ -1142,8 +1159,33 @@ export const Timeline = memo(function Timeline({
             setCurrentFrame(f)
           }}
         />
-        <div className="mx-0.5 whitespace-nowrap rounded-md border border-border/50 bg-card px-1.5 py-px font-mono text-[9px] tabular-nums text-muted-foreground">
-          F{String(Math.round(currentFrame)).padStart(4, "0")} / {fc.toString().padStart(4, "0")}
+        <div className="mx-0.5 flex min-w-0 items-center gap-0.5 whitespace-nowrap rounded-md border border-border/50 bg-card px-1 py-px font-mono text-[9px] tabular-nums text-muted-foreground">
+          <span>F{padFrame4(currentFrame)}</span>
+          <span className="opacity-40">/</span>
+          <input
+            type="text"
+            inputMode="numeric"
+            aria-label="Clip end frame"
+            disabled={!clip}
+            value={endDraft ?? padFrame4(fc)}
+            onFocus={() => setEndDraft(padFrame4(fc))}
+            onChange={(e) => setEndDraft(e.target.value)}
+            onBlur={() => {
+              const raw = endDraft ?? ""
+              setEndDraft(null)
+              const v = parseInt(raw.replace(/\s/g, ""), 10)
+              if (!Number.isFinite(v) || !clip) return
+              setClip({ ...clip, frameCount: v })
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur()
+            }}
+            className={cn(
+              "h-4 w-[46px] min-w-0 rounded border border-transparent bg-transparent px-0.5 text-right text-[9px] tabular-nums outline-none",
+              "focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/30",
+              !clip && "pointer-events-none opacity-40",
+            )}
+          />
         </div>
         <div className="mx-0.5 h-3.5 w-px shrink-0 bg-border" />
         {/* Channel tabs */}

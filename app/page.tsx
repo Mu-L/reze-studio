@@ -7,6 +7,7 @@ import {
   useMemo,
   useCallback,
   type ChangeEvent,
+  type SetStateAction,
 } from "react"
 import { Engine, Model, Vec3, parsePmxFolderInput, pmxFileAtRelativePath } from "reze-engine"
 import { Button } from "@/components/ui/button"
@@ -23,6 +24,7 @@ import {
   loadClip as idbLoadClip,
   clearClip as idbClearClip,
 } from "@/lib/editor-persist"
+import { clipAfterKeyframeEdit, DEFAULT_STUDIO_CLIP_FRAMES } from "@/lib/clip-duration"
 import packageJson from "../package.json"
 
 const MODEL_PATH = "/models/reze/reze.pmx"
@@ -39,7 +41,7 @@ const IDLE_CLIP_TIMEOUT_MS = 10_000
 const BUNDLED_PMX_FILENAME = MODEL_PATH.replace(/^.*\//, "") || "model.pmx"
 
 function emptyStudioClip(): AnimationClip {
-  return { boneTracks: new Map(), morphTracks: new Map(), frameCount: 0 }
+  return { boneTracks: new Map(), morphTracks: new Map(), frameCount: DEFAULT_STUDIO_CLIP_FRAMES }
 }
 
 /** Keep only tracks whose bones/morphs exist on the new model. */
@@ -62,7 +64,10 @@ function clipRetainedForModel(
   for (const t of boneTracks.values()) for (const k of t) inferred = Math.max(inferred, k.frame)
   for (const t of morphTracks.values()) for (const k of t) inferred = Math.max(inferred, k.frame)
   const empty = boneTracks.size === 0 && morphTracks.size === 0
-  return { boneTracks, morphTracks, frameCount: empty ? 0 : Math.max(clip.frameCount, inferred) }
+  const end = empty
+    ? Math.max(clip.frameCount, DEFAULT_STUDIO_CLIP_FRAMES)
+    : Math.max(clip.frameCount, inferred)
+  return { boneTracks, morphTracks, frameCount: end }
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -114,7 +119,15 @@ export default function Home() {
   const persistedMeta = useRef<ReturnType<typeof loadMeta> | null>(null)
 
   // ─── Clip synced with engine via loadClip(STUDIO_ANIM_NAME) / getClip ──
-  const [clip, setClip] = useState<AnimationClip | null>(null)
+  const [clip, setClipState] = useState<AnimationClip | null>(null)
+  /** Normalize duration after key edits / loads so end ≥ last key and transport never stays at 0. */
+  const setClip = useCallback((action: SetStateAction<AnimationClip | null>) => {
+    setClipState((prev) => {
+      const next = typeof action === "function" ? action(prev) : action
+      if (next == null) return null
+      return clipAfterKeyframeEdit(next)
+    })
+  }, [])
   /** Model finished loading (file menu + export need a live Model instance). */
   const [studioReady, setStudioReady] = useState(false)
   /** User-facing clip label for default save names (`{clipDisplayName}-export.vmd` / `.json`). */
@@ -521,6 +534,10 @@ export default function Home() {
     if (currentFrame >= frameCount) setCurrentFrame(0)
   }, [playing, currentFrame, frameCount])
 
+  useEffect(() => {
+    setCurrentFrame((c) => Math.min(c, frameCount))
+  }, [frameCount])
+
   // Timeline key click: jump playhead; curve keys also focus the bone on the list.
   useEffect(() => {
     if (selectedKeyframes.length !== 1) return
@@ -584,7 +601,7 @@ export default function Home() {
   const insertKeyframeAtPlayhead = useCallback(() => {
     const model = modelRef.current
     if (!clip || !activeBone || activeMorph || !model) return
-    const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
+    const frame = Math.round(Math.max(0, currentFrame))
     model.loadClip(STUDIO_ANIM_NAME, clip)
     model.seek(Math.max(0, currentFrame) / 30)
     const pose = readLocalPoseAfterSeek(model, activeBone)
@@ -863,6 +880,7 @@ export default function Home() {
           <div className="h-[220px] shrink-0 border-t border-border">
             <Timeline
               clip={clip}
+              setClip={setClip}
               currentFrame={currentFrame}
               setCurrentFrame={setCurrentFrame}
               playing={playing}
