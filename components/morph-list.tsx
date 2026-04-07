@@ -8,11 +8,11 @@ import type { AnimationClip } from "reze-engine"
 interface MorphListProps {
   morphNames: string[]
   clip: AnimationClip | null
-  activeMorph: string | null
+  selectedMorph: string | null
   onSelectMorph: (name: string) => void
 }
 
-export const MorphList = memo(function MorphList({ morphNames, clip, activeMorph, onSelectMorph }: MorphListProps) {
+export const MorphList = memo(function MorphList({ morphNames, clip, selectedMorph, onSelectMorph }: MorphListProps) {
   return (
     <ScrollArea className="h-full">
       <div className="py-1">
@@ -21,7 +21,7 @@ export const MorphList = memo(function MorphList({ morphNames, clip, activeMorph
         ) : (
           morphNames.map((name) => {
             const kfCount = clip?.morphTracks.get(name)?.length ?? 0
-            const isActive = activeMorph === name
+            const isActive = selectedMorph === name
             return (
               <button
                 key={name}

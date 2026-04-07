@@ -6,25 +6,39 @@ import {
   useState,
   useMemo,
   useCallback,
+  memo,
+  forwardRef,
   type ChangeEvent,
-  type SetStateAction,
+  type InputHTMLAttributes,
+  type RefObject,
 } from "react"
+import Link from "next/link"
+import Image from "next/image"
+import { FilePlus2, FolderOpen, FileMusic, FileDown } from "lucide-react"
 import { Engine, Model, Vec3, parsePmxFolderInput, pmxFileAtRelativePath } from "reze-engine"
 import { Button } from "@/components/ui/button"
-import { EditorLeftPanel, EditorStatusFooter, EditorViewport } from "@/components/editor-chrome"
-import { PropertiesInspector } from "@/components/properties-inspector"
-import { Timeline, type SelectedKeyframe } from "@/components/timeline"
-import { BONE_GROUPS, quatToEuler } from "@/lib/animation"
-import { interpolationTemplateForFrame, readLocalPoseAfterSeek, upsertMorphKeyframeAtFrame } from "@/lib/keyframe-insert"
-import type { AnimationClip, BoneKeyframe, MorphKeyframe } from "reze-engine"
 import {
-  saveMeta,
-  loadMeta,
-  saveClip as idbSaveClip,
-  loadClip as idbLoadClip,
-  clearClip as idbClearClip,
-} from "@/lib/editor-persist"
-import { clipAfterKeyframeEdit, DEFAULT_STUDIO_CLIP_FRAMES } from "@/lib/clip-duration"
+  Menubar,
+  MenubarContent,
+  MenubarGroup,
+  MenubarItem,
+  MenubarMenu,
+  MenubarSeparator,
+  MenubarTrigger,
+} from "@/components/ui/menubar"
+import { BoneList } from "@/components/bone-list"
+import { MorphList } from "@/components/morph-list"
+import { PropertiesInspector } from "@/components/properties-inspector"
+import { Timeline } from "@/components/timeline"
+import { BONE_GROUPS, quatToEuler } from "@/lib/animation"
+import type { AnimationClip, BoneKeyframe, MorphKeyframe } from "reze-engine"
+import { Studio, useStudio } from "@/context/studio-context"
+import {
+  DEFAULT_STUDIO_CLIP_FRAMES,
+  interpolationTemplateForFrame,
+  readLocalPoseAfterSeek,
+  upsertMorphKeyframeAtFrame,
+} from "@/lib/utils"
 import packageJson from "../package.json"
 
 const MODEL_PATH = "/models/reze/reze.pmx"
@@ -33,10 +47,6 @@ const REPO_URL = "https://github.com/AmyangXYZ/reze-studio"
 const DOCS_README_URL = `${REPO_URL}/blob/main/README.md`
 const VMD_PATH = "/animations/miku.vmd"
 const STUDIO_ANIM_NAME = "studio"
-/** Autosave cadence — VMD export + IDB are heavy; keep off the hot path vs 5s. */
-const PERSIST_INTERVAL_MS = 20_000
-/** Ensures idle clip backup runs even under load (still after meta, which is cheap). */
-const IDLE_CLIP_TIMEOUT_MS = 10_000
 /** Basename for status bar when using bundled `MODEL_PATH` PMX. */
 const BUNDLED_PMX_FILENAME = MODEL_PATH.replace(/^.*\//, "") || "model.pmx"
 
@@ -109,29 +119,341 @@ function poseNearEqual(
   )
 }
 
-export default function Home() {
+/** Canvas + error overlay — playhead updates won’t reconcile this subtree. */
+const StudioViewport = memo(
+  forwardRef<HTMLCanvasElement, { engineError: string | null }>(function StudioViewport(
+    { engineError },
+    ref,
+  ) {
+    return (
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <canvas ref={ref} className="block h-full w-full touch-none" />
+        {engineError ? (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/70 p-4 text-center text-sm text-muted-foreground">
+            {engineError}
+          </div>
+        ) : null}
+      </div>
+    )
+  }),
+)
+
+type StudioLeftPanelProps = {
+  vmdInputRef: RefObject<HTMLInputElement | null>
+  pmxFolderInputRef: RefObject<HTMLInputElement | null>
+  onPickVmdFile: (e: ChangeEvent<HTMLInputElement>) => void
+  onPickPmxFolder: (e: ChangeEvent<HTMLInputElement>) => void
+  menubarValue: string
+  onMenubarValueChange: (v: string) => void
+  studioReady: boolean
+  resetStudioDocument: () => void
+  exportClipVmd: () => void
+  pmxPickFiles: File[] | null
+  pmxPickPaths: string[]
+  pmxPickSelected: string
+  onPmxPickSelectedChange: (path: string) => void
+  onConfirmPmxPick: () => void
+  modelBones: string[]
+  selectedGroup: string
+  selectedBone: string | null
+  onSelectGroup: (g: string) => void
+  onSelectBone: (b: string) => void
+  morphNames: string[]
+  selectedMorph: string | null
+  onSelectMorph: (name: string) => void
+  docsReadmeUrl: string
+  repoUrl: string
+  appVersion: string
+}
+
+/** File menu + bone/morph lists — lives in page so the shell isn’t a separate layout file. */
+const StudioLeftPanel = memo(function StudioLeftPanel({
+  vmdInputRef,
+  pmxFolderInputRef,
+  onPickVmdFile,
+  onPickPmxFolder,
+  menubarValue,
+  onMenubarValueChange,
+  studioReady,
+  resetStudioDocument,
+  exportClipVmd,
+  pmxPickFiles,
+  pmxPickPaths,
+  pmxPickSelected,
+  onPmxPickSelectedChange,
+  onConfirmPmxPick,
+  modelBones,
+  selectedGroup,
+  selectedBone,
+  onSelectGroup,
+  onSelectBone,
+  morphNames,
+  selectedMorph,
+  onSelectMorph,
+  docsReadmeUrl,
+  repoUrl,
+  appVersion,
+}: StudioLeftPanelProps) {
+  const { clip } = useStudio()
+  const hasClip = clip != null
+  return (
+    <aside className="flex w-56 shrink-0 flex-col border-r border-border">
+      <div className="shrink-0 border-b">
+        <div className="pl-2 pt-0 flex items-center justify-between pb-1">
+          <h1 className="scroll-m-20 max-w-28 text-md font-extrabold leading-tight tracking-tight text-balance">
+            REZE STUDIO
+          </h1>
+          <div className="flex shrink-0 items-center gap-0.5">
+            <Button variant="ghost" size="sm" asChild className="hover:bg-black hover:text-white rounded-full">
+              <Link href="https://github.com/AmyangXYZ/reze-studio" target="_blank">
+                <Image src="/github-mark-white.svg" alt="GitHub" width={16} height={16} />
+              </Link>
+            </Button>
+          </div>
+        </div>
+
+        <div className="px-3 pb-2">
+          <input
+            ref={vmdInputRef}
+            type="file"
+            accept=".vmd"
+            className="hidden"
+            tabIndex={-1}
+            aria-hidden
+            onChange={onPickVmdFile}
+          />
+          <input
+            ref={pmxFolderInputRef}
+            type="file"
+            className="fixed left-0 top-0 -z-10 h-px w-px opacity-0"
+            multiple
+            {...({ webkitdirectory: "", mozdirectory: "" } as InputHTMLAttributes<HTMLInputElement>)}
+            onChange={onPickPmxFolder}
+          />
+          <Menubar
+            value={menubarValue}
+            onValueChange={onMenubarValueChange}
+            className="h-4 gap-0 rounded-none border-0 bg-transparent p-0 shadow-none"
+          >
+            <MenubarMenu value="file">
+              <MenubarTrigger className="h-4 rounded-sm px-1.5 py-0 text-xs font-normal text-muted-foreground">
+                File
+              </MenubarTrigger>
+              <MenubarContent sideOffset={4} className="min-w-32 p-0.5 text-xs">
+                <MenubarGroup>
+                  <MenubarItem
+                    className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground"
+                    disabled={!studioReady}
+                    onSelect={resetStudioDocument}
+                  >
+                    <FilePlus2 className="size-3.5" />
+                    New
+                  </MenubarItem>
+                  <MenubarSeparator className="my-0.5" />
+                  <MenubarItem
+                    className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground"
+                    onSelect={(e) => {
+                      e.preventDefault()
+                      pmxFolderInputRef.current?.click()
+                    }}
+                  >
+                    <FolderOpen className="size-3.5" />
+                    Load PMX folder…
+                  </MenubarItem>
+                  <MenubarItem
+                    className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground"
+                    disabled={!studioReady}
+                    onSelect={() => vmdInputRef.current?.click()}
+                  >
+                    <FileMusic className="size-3.5" />
+                    Load VMD…
+                  </MenubarItem>
+                </MenubarGroup>
+                <MenubarSeparator className="my-0.5" />
+                <MenubarGroup>
+                  <MenubarItem
+                    className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground"
+                    disabled={!studioReady || !hasClip}
+                    onSelect={exportClipVmd}
+                  >
+                    <FileDown className="size-3.5" />
+                    Export VMD…
+                  </MenubarItem>
+                </MenubarGroup>
+              </MenubarContent>
+            </MenubarMenu>
+            <MenubarMenu value="help">
+              <MenubarTrigger className="h-4 rounded-sm px-1.5 py-0 text-xs font-normal text-muted-foreground">
+                Help
+              </MenubarTrigger>
+              <MenubarContent sideOffset={4} className="min-w-32 p-0.5 text-xs">
+                <MenubarGroup>
+                  <MenubarItem className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground" asChild>
+                    <Link href={docsReadmeUrl} target="_blank" rel="noreferrer">
+                      Tutorial (README)
+                    </Link>
+                  </MenubarItem>
+                  <MenubarItem className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground" disabled>
+                    Keyboard shortcuts…
+                  </MenubarItem>
+                  <MenubarSeparator className="my-0.5" />
+                  <MenubarItem
+                    className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground"
+                    onSelect={() => {
+                      window.alert(`Reze Studio ${appVersion}\nWebGPU MMD editor — ${repoUrl}`)
+                    }}
+                  >
+                    About Reze Studio
+                  </MenubarItem>
+                  <MenubarItem className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground" asChild>
+                    <Link href={`${repoUrl}/issues`} target="_blank" rel="noreferrer">
+                      Report an issue
+                    </Link>
+                  </MenubarItem>
+                </MenubarGroup>
+              </MenubarContent>
+            </MenubarMenu>
+            <MenubarMenu value="settings">
+              <MenubarTrigger className="h-4 rounded-sm px-1.5 py-0 text-xs font-normal text-muted-foreground">
+                Settings
+              </MenubarTrigger>
+              <MenubarContent sideOffset={4} className="min-w-32 p-0.5 text-xs">
+                <MenubarGroup>
+                  <MenubarItem className="gap-2 py-1 pl-2 pr-1.5 text-[11px] text-muted-foreground" disabled>
+                    Theme…
+                  </MenubarItem>
+                </MenubarGroup>
+              </MenubarContent>
+            </MenubarMenu>
+          </Menubar>
+          {pmxPickFiles && pmxPickPaths.length > 1 ? (
+            <div className="mt-2 flex flex-col gap-1.5 rounded border border-border bg-muted/30 p-2 text-[10px]">
+              <span className="text-muted-foreground">Multiple .pmx files — choose one:</span>
+              <select
+                className="w-full rounded border border-border bg-background px-1 py-0.5 text-[11px]"
+                value={pmxPickSelected}
+                onChange={(e) => onPmxPickSelectedChange(e.target.value)}
+              >
+                {pmxPickPaths.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </select>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="h-7 text-[11px]"
+                onClick={() => void onConfirmPmxPick()}
+              >
+                Load selected PMX
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <BoneList
+            modelBones={modelBones}
+            clip={clip}
+            selectedGroup={selectedGroup}
+            selectedBone={selectedBone}
+            onSelectGroup={onSelectGroup}
+            onSelectBone={onSelectBone}
+          />
+        </div>
+        <div className="flex max-h-[196px] shrink-0 flex-col border-t border-border">
+          <div className="shrink-0 px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
+            Morphs
+          </div>
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <MorphList morphNames={morphNames} clip={clip} selectedMorph={selectedMorph} onSelectMorph={onSelectMorph} />
+          </div>
+        </div>
+      </div>
+    </aside>
+  )
+})
+
+const StudioStatusFooter = memo(function StudioStatusFooter({
+  statusPmxFileName,
+  clipDisplayName,
+  hasClip,
+  statusMessage,
+  statusFps,
+  appVersion,
+}: {
+  statusPmxFileName: string
+  clipDisplayName: string
+  hasClip: boolean
+  statusMessage: string
+  statusFps: number | null
+  appVersion: string
+}) {
+  return (
+    <footer
+      className="flex h-6 shrink-0 items-center gap-2 border-t border-border px-2 text-[10.5px] text-muted-foreground"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex min-w-0 shrink-0 items-center gap-x-2 [overflow-wrap:anywhere]">
+        <span>
+          Model:{" "}
+          <span className="font-medium text-foreground" title={statusPmxFileName}>
+            {statusPmxFileName}
+          </span>
+        </span>
+        <span className="text-border" aria-hidden>
+          ·
+        </span>
+        <span>
+          Animation:{" "}
+          <span className="font-medium text-foreground" title={hasClip ? `${clipDisplayName}.vmd` : undefined}>
+            {hasClip ? `${clipDisplayName}.vmd` : "—"}
+          </span>
+        </span>
+      </div>
+      <div className="min-w-0 flex-1 truncate px-2 text-left text-[10px] text-muted-foreground/90">{statusMessage}</div>
+      <div className="flex shrink-0 items-center gap-x-2 tabular-nums">
+        <span title="Main-thread / compositor frame rate">
+          {statusFps != null ? `${statusFps} FPS` : "— FPS"}
+        </span>
+        <span className="text-border" aria-hidden>
+          ·
+        </span>
+        <span>v{appVersion}</span>
+      </div>
+    </footer>
+  )
+})
+
+function StudioPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
   const modelRef = useRef<Model | null>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
 
-  // ─── Persisted meta (deferred to useEffect to avoid SSR hydration mismatch) ──
-  const persistedMeta = useRef<ReturnType<typeof loadMeta> | null>(null)
-
-  // ─── Clip synced with engine via loadClip(STUDIO_ANIM_NAME) / getClip ──
-  const [clip, setClipState] = useState<AnimationClip | null>(null)
-  /** Normalize duration after key edits / loads so end ≥ last key and transport never stays at 0. */
-  const setClip = useCallback((action: SetStateAction<AnimationClip | null>) => {
-    setClipState((prev) => {
-      const next = typeof action === "function" ? action(prev) : action
-      if (next == null) return null
-      return clipAfterKeyframeEdit(next)
-    })
-  }, [])
+  // ─── Document + selection live in `<Studio>`; page wires engine + chrome only ──
+  const {
+    clip,
+    commit,
+    clipDisplayName,
+    setClipDisplayName,
+    selectedBone,
+    setSelectedBone,
+    selectedMorph,
+    setSelectedMorph,
+    selectedKeyframes,
+    setSelectedKeyframes,
+    currentFrame,
+    setCurrentFrame,
+    playing,
+    setPlaying,
+  } = useStudio()
   /** Model finished loading (file menu + export need a live Model instance). */
   const [studioReady, setStudioReady] = useState(false)
-  /** User-facing clip label for default save names (`{clipDisplayName}-export.vmd` / `.json`). */
-  const [clipDisplayName, setClipDisplayName] = useState("clip")
 
   const vmdInputRef = useRef<HTMLInputElement>(null)
   const pmxFolderInputRef = useRef<HTMLInputElement>(null)
@@ -146,7 +468,6 @@ export default function Home() {
   const [modelBoneOrder, setModelBoneOrder] = useState<string[]>([])
   /** From `model.getMorphing().morphs` (engine has no `getMorphs()` alias yet). */
   const [morphNames, setMorphNames] = useState<string[]>([])
-  const [activeMorph, setActiveMorph] = useState<string | null>(null)
   const [morphWeightReadout, setMorphWeightReadout] = useState<number | null>(null)
 
   /** Bones with tracks in the current clip (and on the model) — timeline rows + keying. */
@@ -160,11 +481,7 @@ export default function Home() {
   /** Sidebar list: strict PMX skeleton order (same for new clips and edits). */
   const sidebarBones = modelBoneOrder
 
-  const [currentFrame, setCurrentFrame] = useState(0)
-  const [playing, setPlaying] = useState(false)
-  const [activeBone, setActiveBone] = useState<string | null>(null)
   const [selectedGroup, setSelectedGroup] = useState("All Bones")
-  const [selectedKeyframes, setSelectedKeyframes] = useState<SelectedKeyframe[]>([])
   /** Bumped on new clip load / reset so Timeline can reset its local view state. */
   const [clipVersion, setClipVersion] = useState(0)
   /** Lifted from Timeline so PropertiesInspector sliders + keyframe selection can sync it. */
@@ -211,94 +528,28 @@ export default function Home() {
     clipDisplayNameRef.current = clipDisplayName
   }, [clipDisplayName])
 
-  // ─── Persist editor state (interval + beforeunload) ──────────────────
-  /** Last clip reference that was written to IndexedDB — skip re-serializing the same object. */
-  const lastSavedClipRef = useRef<AnimationClip | null>(null)
-  /** Coalesce deferred clip writes so rapid timers don’t stack export work. */
-  const idleClipHandleRef = useRef<ReturnType<typeof requestIdleCallback> | number | null>(null)
-
-  const cancelScheduledClipPersist = useCallback(() => {
-    const h = idleClipHandleRef.current
-    if (h == null) return
-    if (typeof cancelIdleCallback !== "undefined") cancelIdleCallback(h as number)
-    else clearTimeout(h as number)
-    idleClipHandleRef.current = null
-  }, [])
-
-  /** Refs only — safe inside requestIdleCallback (latest clip vs stale closure). */
-  const persistClipToIdbSync = useCallback(() => {
-    const c = clipRef.current
-    if (playRef.current || c === lastSavedClipRef.current) return
-    const model = modelRef.current
-    if (c && model) {
-      try {
-        model.loadClip(STUDIO_ANIM_NAME, c)
-        const buf = model.exportVmd(STUDIO_ANIM_NAME)
-        void idbSaveClip(buf)
-      } catch { /* export can fail on empty clips — ignore */ }
-    } else {
-      void idbClearClip()
-    }
-    lastSavedClipRef.current = c
-  }, [])
-
-  const persistState = useCallback(
-    (opts?: { syncClip?: boolean }) => {
-      saveMeta({
-        activeBone,
-        activeMorph,
-        selectedGroup,
-        currentFrame,
-        clipDisplayName,
-        hasClip: clip != null,
-      })
-      if (opts?.syncClip) {
-        cancelScheduledClipPersist()
-        persistClipToIdbSync()
-        return
-      }
-      cancelScheduledClipPersist()
-      if (typeof requestIdleCallback !== "undefined") {
-        idleClipHandleRef.current = requestIdleCallback(
-          () => {
-            idleClipHandleRef.current = null
-            persistClipToIdbSync()
-          },
-          { timeout: IDLE_CLIP_TIMEOUT_MS },
-        )
-      } else {
-        idleClipHandleRef.current = window.setTimeout(() => {
-          idleClipHandleRef.current = null
-          persistClipToIdbSync()
-        }, 0)
-      }
-    },
-    [
-      activeBone,
-      activeMorph,
-      selectedGroup,
-      currentFrame,
-      clipDisplayName,
-      clip,
-      cancelScheduledClipPersist,
-      persistClipToIdbSync,
-    ],
-  )
-
-  const persistRef = useRef(persistState)
-  useEffect(() => {
-    persistRef.current = persistState
-  }, [persistState])
+  /** Unsaved clip edits — browser `beforeunload` only reads refs (stable listener). */
+  const documentDirtyRef = useRef(false)
+  /** Skip marking dirty for the next `clip` update (loads / reset / export handoff). */
+  const suppressClipDirtyRef = useRef(0)
 
   useEffect(() => {
-    const iv = setInterval(() => persistRef.current(), PERSIST_INTERVAL_MS)
-    const onUnload = () => persistRef.current({ syncClip: true })
-    window.addEventListener("beforeunload", onUnload)
-    return () => {
-      clearInterval(iv)
-      window.removeEventListener("beforeunload", onUnload)
-      persistRef.current({ syncClip: true })
+    if (clip == null) return
+    if (suppressClipDirtyRef.current > 0) {
+      suppressClipDirtyRef.current -= 1
+      return
     }
+    documentDirtyRef.current = true
+  }, [clip])
+
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!documentDirtyRef.current) return
+      e.preventDefault()
+      e.returnValue = ""
+    }
+    window.addEventListener("beforeunload", onBeforeUnload)
+    return () => window.removeEventListener("beforeunload", onBeforeUnload)
   }, [])
 
   // ─── Playback loop ───────────────────────────────────────────────────
@@ -308,24 +559,37 @@ export default function Home() {
       lastT.current = null
       return
     }
+    if (frameCount <= 0) {
+      lastT.current = null
+      return
+    }
     let raf: number
     const tick = (ts: number) => {
       if (!playRef.current) return
-      if (lastT.current !== null)
-        setCurrentFrame((p) => {
-          const n = p + ((ts - (lastT.current ?? ts)) / 1000) * 30
-          if (n >= frameCount) {
-            setPlaying(false)
-            return frameCount
-          }
-          return n
-        })
+      const prevT = lastT.current
       lastT.current = ts
+      if (prevT === null) {
+        raf = requestAnimationFrame(tick)
+        return
+      }
+      let hitEnd = false
+      setCurrentFrame((p) => {
+        const n = p + ((ts - prevT) / 1000) * 30
+        if (n >= frameCount) {
+          hitEnd = true
+          return frameCount
+        }
+        return n
+      })
+      if (hitEnd) {
+        setPlaying(false)
+        return
+      }
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [playing, frameCount])
+  }, [playing, frameCount, setCurrentFrame, setPlaying])
 
   // ─── Keyboard shortcuts ──────────────────────────────────────────────
   useEffect(() => {
@@ -347,43 +611,41 @@ export default function Home() {
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [frameCount])
+  }, [frameCount, setCurrentFrame, setPlaying])
 
   // ─── Bone selection handlers ─────────────────────────────────────────
   const handleSelectGroup = useCallback((g: string) => {
     setSelectedGroup((prev) => (prev === g ? "" : g))
-    setActiveBone(null)
-    setActiveMorph(null)
+    setSelectedBone(null)
+    setSelectedMorph(null)
     setSelectedKeyframes([])
-  }, [])
+  }, [setSelectedBone, setSelectedMorph, setSelectedKeyframes])
 
   const handleSelectBone = useCallback((b: string) => {
-    setActiveMorph(null)
-    setActiveBone(b)
+    setSelectedMorph(null)
+    setSelectedBone(b)
     setSelectedKeyframes([])
-    setTimelineTab((prev) => (prev === "morph" ? "allRot" : prev))
-  }, [])
+  }, [setSelectedBone, setSelectedMorph, setSelectedKeyframes])
 
   const handleSelectMorph = useCallback((name: string) => {
-    setActiveBone(null)
-    setActiveMorph(name)
+    setSelectedBone(null)
+    setSelectedMorph(name)
     setSelectedKeyframes([])
-    setTimelineTab("morph")
-  }, [])
+  }, [setSelectedBone, setSelectedMorph, setSelectedKeyframes])
 
   useEffect(() => {
-    if (activeBone && !pmxBoneNames.has(activeBone)) setActiveBone(null)
-  }, [activeBone, pmxBoneNames])
+    if (selectedBone && !pmxBoneNames.has(selectedBone)) setSelectedBone(null)
+  }, [selectedBone, pmxBoneNames, setSelectedBone])
 
   useEffect(() => {
-    if (activeMorph && !morphNames.includes(activeMorph)) setActiveMorph(null)
-  }, [activeMorph, morphNames])
+    if (selectedMorph && !morphNames.includes(selectedMorph)) setSelectedMorph(null)
+  }, [selectedMorph, morphNames, setSelectedMorph])
 
   useEffect(() => {
     setSelectedKeyframes((prev) =>
       prev.filter((s) => s.type !== "curve" || !s.bone || pmxBoneNames.has(s.bone)),
     )
-  }, [pmxBoneNames])
+  }, [pmxBoneNames, setSelectedKeyframes])
 
   // ─── Engine init ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -429,56 +691,21 @@ export default function Home() {
           setStatusFps(fps > 0 ? fps : null)
         })
 
-        // Hydrate persisted meta (client-only — safe from SSR mismatch)
-        const meta = loadMeta()
-        persistedMeta.current = meta
-
-        // Restore persisted clip from IndexedDB, or fall back to default VMD
-        let restored = false
-        if (meta.hasClip && modelRef.current) {
-          try {
-            const buf = await idbLoadClip()
-            if (buf && !disposed) {
-              const blob = new Blob([buf], { type: "application/octet-stream" })
-              const url = URL.createObjectURL(blob)
-              try {
-                await modelRef.current.loadVmd(STUDIO_ANIM_NAME, url)
-                const c = modelRef.current.getClip(STUDIO_ANIM_NAME)
-                if (c) {
-                  setClip(c)
-                  setClipDisplayName(meta.clipDisplayName)
-                  setCurrentFrame(meta.currentFrame)
-                  setActiveBone(meta.activeBone)
-                  setActiveMorph(meta.activeMorph)
-                  setSelectedGroup(meta.selectedGroup)
-                  modelRef.current.show(STUDIO_ANIM_NAME)
-                  modelRef.current.seek(Math.max(0, meta.currentFrame) / 30)
-                  if (modelRef.current.name === "reze") modelRef.current.setMorphWeight("抗穿模", 0.5)
-                  restored = true
-                }
-              } finally {
-                URL.revokeObjectURL(url)
-              }
-            }
-          } catch (e) {
-            console.warn("Failed to restore persisted clip:", e)
+        try {
+          await modelRef.current?.loadVmd(STUDIO_ANIM_NAME, VMD_PATH)
+          if (disposed) return
+          const c = modelRef.current?.getClip(STUDIO_ANIM_NAME)
+          if (c) {
+            suppressClipDirtyRef.current += 1
+            commit(c)
+            documentDirtyRef.current = false
+            setClipDisplayName(sanitizeClipFilenameBase(fileStem(VMD_PATH)))
+            modelRef.current?.show(STUDIO_ANIM_NAME)
+            modelRef.current?.seek(0)
+            if (modelRef.current?.name === "reze") modelRef.current?.setMorphWeight("抗穿模", 0.5)
           }
-        }
-        if (!restored) {
-          try {
-            await modelRef.current?.loadVmd(STUDIO_ANIM_NAME, VMD_PATH)
-            if (disposed) return
-            const c = modelRef.current?.getClip(STUDIO_ANIM_NAME)
-            if (c) {
-              setClip(c)
-              setClipDisplayName(sanitizeClipFilenameBase(fileStem(VMD_PATH)))
-              modelRef.current?.show(STUDIO_ANIM_NAME)
-              modelRef.current?.seek(0)
-              if (modelRef.current?.name === "reze") modelRef.current?.setMorphWeight("抗穿模", 0.5)
-            }
-          } catch (e) {
-            console.warn(`VMD load failed — add file at public${VMD_PATH}`, e)
-          }
+        } catch (e) {
+          console.warn(`VMD load failed — add file at public${VMD_PATH}`, e)
         }
         setStudioReady(true)
 
@@ -497,7 +724,7 @@ export default function Home() {
       setModelBoneOrder([])
       setPmxBoneNames(new Set())
       setMorphNames([])
-      setActiveMorph(null)
+      setSelectedMorph(null)
       setMorphWeightReadout(null)
       setStatusPmxFileName("—")
       setStatusFps(null)
@@ -507,7 +734,7 @@ export default function Home() {
       engineRef.current?.dispose()
       engineRef.current = null
     }
-  }, [])
+  }, [commit, setClipDisplayName, setSelectedMorph])
 
   // Keep model pose locked to timeline frame; refresh morph weight readout when a morph is selected.
   useEffect(() => {
@@ -515,19 +742,19 @@ export default function Home() {
     if (!model || !clip) return
     model.loadClip(STUDIO_ANIM_NAME, clip)
     model.seek(Math.max(0, currentFrame) / 30)
-    if (!activeMorph) {
+    if (!selectedMorph) {
       setMorphWeightReadout(null)
       return
     }
     const morphing = model.getMorphing()
-    const idx = morphing.morphs.findIndex((m) => m.name === activeMorph)
+    const idx = morphing.morphs.findIndex((m) => m.name === selectedMorph)
     if (idx < 0) {
       setMorphWeightReadout(null)
       return
     }
     const w = model.getMorphWeights()[idx]
     setMorphWeightReadout((prev) => (prev === w ? prev : w))
-  }, [currentFrame, clip, activeMorph])
+  }, [currentFrame, clip, selectedMorph])
 
   useEffect(() => {
     const model = modelRef.current
@@ -544,91 +771,102 @@ export default function Home() {
   useEffect(() => {
     if (!playing || frameCount <= 0) return
     if (currentFrame >= frameCount) setCurrentFrame(0)
-  }, [playing, currentFrame, frameCount])
+  }, [playing, currentFrame, frameCount, setCurrentFrame])
 
   useEffect(() => {
     setCurrentFrame((c) => Math.min(c, frameCount))
-  }, [frameCount])
+  }, [frameCount, setCurrentFrame])
 
-  // Timeline key click: jump playhead; curve keys also focus the bone/morph on the list
-  // and auto-switch the timeline channel tab to match the selected channel.
+  // Timeline key click: jump playhead; curve keys focus bone/morph on the list — tab stays user-controlled.
   useEffect(() => {
     if (selectedKeyframes.length !== 1) return
     const s = selectedKeyframes[0]
     if (s.morph) {
-      setActiveBone(null)
-      setActiveMorph(s.morph)
-      setTimelineTab("morph")
+      setSelectedBone(null)
+      setSelectedMorph(s.morph)
     } else {
-      setActiveMorph(null)
-      if (s.type === "curve" && s.bone) setActiveBone(s.bone)
-      if (s.channel && ["rx", "ry", "rz", "tx", "ty", "tz"].includes(s.channel)) {
-        setTimelineTab(s.channel)
-      }
+      setSelectedMorph(null)
+      if (s.type === "curve" && s.bone) setSelectedBone(s.bone)
     }
     setCurrentFrame(s.frame)
-  }, [selectedKeyframes])
+  }, [selectedKeyframes, setSelectedBone, setSelectedMorph, setCurrentFrame])
 
   const deleteSelectedKeyframes = useCallback(() => {
     if (!clip || selectedKeyframes.length !== 1) return
     const sel = selectedKeyframes[0]
+    setSelectedKeyframes([])
+
     if (sel.type === "curve" && sel.morph) {
-      const track = clip.morphTracks.get(sel.morph)
-      if (!track) return
-      const i = track.findIndex((k) => k.frame === sel.frame)
-      if (i < 0) return
-      track.splice(i, 1)
-      if (track.length === 0) clip.morphTracks.delete(sel.morph)
-      setSelectedKeyframes([])
-      setClip({ ...clip, morphTracks: new Map(clip.morphTracks) })
-    } else if (sel.type === "curve" && sel.bone) {
-      const track = clip.boneTracks.get(sel.bone)
-      if (!track) return
-      const i = track.findIndex((k) => k.frame === sel.frame)
-      if (i < 0) return
-      track.splice(i, 1)
-      if (track.length === 0) clip.boneTracks.delete(sel.bone)
-      setSelectedKeyframes([])
-      setClip({ ...clip, boneTracks: new Map(clip.boneTracks) })
-    } else if (sel.type === "dope") {
-      const f = sel.frame
-      if (timelineTab === "morph" && activeMorph) {
-        const track = clip.morphTracks.get(activeMorph)
-        if (track) {
-          const i = track.findIndex((k) => k.frame === f)
-          if (i >= 0) {
-            track.splice(i, 1)
-            if (track.length === 0) clip.morphTracks.delete(activeMorph)
-          }
-        }
-        setSelectedKeyframes([])
-        setClip({ ...clip, morphTracks: new Map(clip.morphTracks) })
-      } else {
-        const dropBones: string[] = []
-        for (const [name, track] of clip.boneTracks.entries()) {
-          const i = track.findIndex((k) => k.frame === f)
-          if (i >= 0) {
-            track.splice(i, 1)
-            if (track.length === 0) dropBones.push(name)
-          }
-        }
-        for (const name of dropBones) clip.boneTracks.delete(name)
-        setSelectedKeyframes([])
-        setClip({ ...clip, boneTracks: new Map(clip.boneTracks) })
-      }
+      commit((prev) => {
+        if (!prev) return prev
+        const track = prev.morphTracks.get(sel.morph!)
+        if (!track) return prev
+        const i = track.findIndex((k) => k.frame === sel.frame)
+        if (i < 0) return prev
+        const morphTracks = new Map(prev.morphTracks)
+        const next = track.filter((_, j) => j !== i)
+        if (next.length === 0) morphTracks.delete(sel.morph!)
+        else morphTracks.set(sel.morph!, next)
+        return { ...prev, morphTracks }
+      })
+      return
     }
-  }, [clip, selectedKeyframes, timelineTab, activeMorph])
+    if (sel.type === "curve" && sel.bone) {
+      commit((prev) => {
+        if (!prev) return prev
+        const track = prev.boneTracks.get(sel.bone!)
+        if (!track) return prev
+        const i = track.findIndex((k) => k.frame === sel.frame)
+        if (i < 0) return prev
+        const boneTracks = new Map(prev.boneTracks)
+        const next = track.filter((_, j) => j !== i)
+        if (next.length === 0) boneTracks.delete(sel.bone!)
+        else boneTracks.set(sel.bone!, next)
+        return { ...prev, boneTracks }
+      })
+      return
+    }
+    if (sel.type !== "dope") return
+    const f = sel.frame
+    if (timelineTab === "morph" && selectedMorph) {
+      commit((prev) => {
+        if (!prev) return prev
+        const track = prev.morphTracks.get(selectedMorph)
+        if (!track) return prev
+        const i = track.findIndex((k) => k.frame === f)
+        if (i < 0) return prev
+        const morphTracks = new Map(prev.morphTracks)
+        const next = track.filter((_, j) => j !== i)
+        if (next.length === 0) morphTracks.delete(selectedMorph)
+        else morphTracks.set(selectedMorph, next)
+        return { ...prev, morphTracks }
+      })
+      return
+    }
+    commit((prev) => {
+      if (!prev) return prev
+      const boneTracks = new Map(prev.boneTracks)
+      for (const [name, track] of prev.boneTracks) {
+        const i = track.findIndex((k) => k.frame === f)
+        if (i < 0) continue
+        const next = track.filter((_, j) => j !== i)
+        if (next.length === 0) boneTracks.delete(name)
+        else boneTracks.set(name, next)
+      }
+      return { ...prev, boneTracks }
+    })
+  }, [clip, selectedKeyframes, timelineTab, selectedMorph, commit, setSelectedKeyframes])
 
   const livePose = useMemo(() => {
     const model = modelRef.current
-    if (!model || !activeBone || !clip) {
+    if (!model || !selectedBone || !clip) {
       livePoseStableRef.current = null
       return null
     }
     // React clip can fork from the engine’s internal clip; push state back before seek/read so sliders stay in sync
     model.loadClip(STUDIO_ANIM_NAME, clip)
     model.seek(Math.max(0, currentFrame) / 30)
-    const p = readLocalPoseAfterSeek(model, activeBone)
+    const p = readLocalPoseAfterSeek(model, selectedBone)
     if (!p) {
       livePoseStableRef.current = null
       return null
@@ -638,7 +876,7 @@ export default function Home() {
     // bones under an IK chain would otherwise display a different value than
     // what's actually stored in the keyframe (and what the timeline shows).
     const frameInt = Math.round(Math.max(0, currentFrame))
-    const boneTrack = clip.boneTracks.get(activeBone)
+    const boneTrack = clip.boneTracks.get(selectedBone)
     const kfAt = boneTrack?.find((k) => k.frame === frameInt)
     const next = kfAt
       ? {
@@ -653,31 +891,31 @@ export default function Home() {
     if (prev && poseNearEqual(prev, next)) return prev
     livePoseStableRef.current = next
     return next
-  }, [currentFrame, clip, activeBone])
+  }, [currentFrame, clip, selectedBone])
 
   const insertKeyframeAtPlayhead = useCallback(() => {
     const model = modelRef.current
     if (!clip || !model) return
     const frame = Math.round(Math.max(0, currentFrame))
 
-    if (activeMorph && !activeBone) {
+    if (selectedMorph && !selectedBone) {
       const w = morphWeightReadout ?? 0
-      setClip(upsertMorphKeyframeAtFrame(clip, activeMorph, frame, w))
-      setSelectedKeyframes([{ type: "curve", morph: activeMorph, frame }])
+      commit(upsertMorphKeyframeAtFrame(clip, selectedMorph, frame, w))
+      setSelectedKeyframes([{ type: "curve", morph: selectedMorph, frame }])
       return
     }
 
-    if (!activeBone) return
+    if (!selectedBone) return
     model.loadClip(STUDIO_ANIM_NAME, clip)
     model.seek(Math.max(0, currentFrame) / 30)
-    const pose = readLocalPoseAfterSeek(model, activeBone)
+    const pose = readLocalPoseAfterSeek(model, selectedBone)
     if (!pose) return
 
-    const prevTrack = clip.boneTracks.get(activeBone)
+    const prevTrack = clip.boneTracks.get(selectedBone)
     const ip = interpolationTemplateForFrame(prevTrack, frame)
     const nextTrack = [...(prevTrack ?? [])].filter((k) => k.frame !== frame)
     nextTrack.push({
-      boneName: activeBone,
+      boneName: selectedBone,
       frame,
       rotation: pose.rotation,
       translation: pose.translation,
@@ -685,21 +923,20 @@ export default function Home() {
     })
     nextTrack.sort((a, b) => a.frame - b.frame)
     const boneTracks = new Map(clip.boneTracks)
-    boneTracks.set(activeBone, nextTrack)
-    setClip({ ...clip, boneTracks })
-    setSelectedKeyframes([{ type: "curve", bone: activeBone, frame, channel: "rx" }])
-  }, [clip, activeBone, activeMorph, currentFrame, morphWeightReadout])
+    boneTracks.set(selectedBone, nextTrack)
+    commit({ ...clip, boneTracks })
+    setSelectedKeyframes([{ type: "curve", bone: selectedBone, frame, channel: "rx" }])
+  }, [clip, selectedBone, selectedMorph, currentFrame, morphWeightReadout, commit, setSelectedKeyframes])
 
   const syncStudioAfterNewClip = useCallback((model: Model) => {
     setCurrentFrame(0)
     setPlaying(false)
     setSelectedKeyframes([])
-    setTimelineTab("allRot")
     setClipVersion((v) => v + 1)
     model.show(STUDIO_ANIM_NAME)
     model.seek(0)
     if (model.name === "reze") model.setMorphWeight("抗穿模", 0.5)
-  }, [])
+  }, [setSelectedKeyframes, setCurrentFrame, setPlaying])
 
   const applyLoadedPmxModel = useCallback(
     (
@@ -724,8 +961,8 @@ export default function Home() {
       setModelBoneOrder(sk)
       setMorphNames(morphNamesList)
       setStatusPmxFileName(pmxFileName.trim() || `${displayStem}.pmx`)
-      setActiveBone((prev) => (prev && boneSet.has(prev) ? prev : null))
-      setActiveMorph((prev) => (prev && morphSet.has(prev) ? prev : null))
+      setSelectedBone((prev) => (prev && boneSet.has(prev) ? prev : null))
+      setSelectedMorph((prev) => (prev && morphSet.has(prev) ? prev : null))
       setSelectedKeyframes((prev) =>
         prev.filter((s) => s.type !== "curve" || !s.bone || boneSet.has(s.bone)),
       )
@@ -756,7 +993,10 @@ export default function Home() {
       }
 
       model.loadClip(STUDIO_ANIM_NAME, nextClip)
-      setClip(nextClip)
+      suppressClipDirtyRef.current += 1
+      commit(nextClip)
+      // Retained motion is still only in memory until export — keep warning if tracks exist.
+      documentDirtyRef.current = hasPrevTimeline
       setClipDisplayName(nextDisplay)
       setCurrentFrame(nextFrame)
       setPlaying(nextPlaying)
@@ -766,7 +1006,15 @@ export default function Home() {
       else model.pause()
       setEngineError(null)
     },
-    [],
+    [
+      commit,
+      setSelectedBone,
+      setSelectedMorph,
+      setSelectedKeyframes,
+      setClipDisplayName,
+      setCurrentFrame,
+      setPlaying,
+    ],
   )
 
   const loadPmxFromFolder = useCallback(
@@ -862,7 +1110,9 @@ export default function Home() {
         await model.loadVmd(STUDIO_ANIM_NAME, url)
         const c = model.getClip(STUDIO_ANIM_NAME)
         if (c) {
-          setClip(c)
+          suppressClipDirtyRef.current += 1
+          commit(c)
+          documentDirtyRef.current = false
           setClipDisplayName(sanitizeClipFilenameBase(fileStem(file.name)))
           syncStudioAfterNewClip(model)
         }
@@ -872,7 +1122,7 @@ export default function Home() {
         URL.revokeObjectURL(url)
       }
     },
-    [syncStudioAfterNewClip],
+    [syncStudioAfterNewClip, commit, setClipDisplayName],
   )
 
   const exportClipVmd = useCallback(() => {
@@ -883,37 +1133,44 @@ export default function Home() {
       model.loadClip(STUDIO_ANIM_NAME, clip)
       const buf = model.exportVmd(STUDIO_ANIM_NAME)
       downloadBlob(new Blob([buf], { type: "application/octet-stream" }), `${base}-export.vmd`)
+      documentDirtyRef.current = false
     } catch (err) {
       window.alert(err instanceof Error ? err.message : String(err))
     }
   }, [clip, clipDisplayName])
 
-  const resetEditorState = useCallback(() => {
+  const resetStudioDocument = useCallback(() => {
     const model = modelRef.current
     if (!model) return
     const fresh = emptyStudioClip()
     model.loadClip(STUDIO_ANIM_NAME, fresh)
-    setClip(fresh)
+    suppressClipDirtyRef.current += 1
+    commit(fresh)
+    documentDirtyRef.current = false
     setClipDisplayName("clip")
     setCurrentFrame(0)
     setPlaying(false)
-    setActiveBone(null)
-    setActiveMorph(null)
+    setSelectedBone(null)
+    setSelectedMorph(null)
     setSelectedKeyframes([])
-    setTimelineTab("allRot")
     // Bump after clearing selections so downstream effects don't see stale keyframes.
     setClipVersion((v) => v + 1)
     model.show(STUDIO_ANIM_NAME)
     model.seek(0)
-    void idbClearClip()
-    saveMeta({ hasClip: false })
-    lastSavedClipRef.current = null
-  }, [])
+  }, [
+    commit,
+    setClipDisplayName,
+    setSelectedBone,
+    setSelectedMorph,
+    setSelectedKeyframes,
+    setCurrentFrame,
+    setPlaying,
+  ])
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden text-foreground">
       <div className="flex min-h-0 flex-1">
-        <EditorLeftPanel
+        <StudioLeftPanel
           vmdInputRef={vmdInputRef}
           pmxFolderInputRef={pmxFolderInputRef}
           onPickVmdFile={onPickVmdFile}
@@ -921,22 +1178,20 @@ export default function Home() {
           menubarValue={menubarValue}
           onMenubarValueChange={setMenubarValue}
           studioReady={studioReady}
-          resetEditorState={resetEditorState}
+          resetStudioDocument={resetStudioDocument}
           exportClipVmd={exportClipVmd}
-          hasClip={clip != null}
           pmxPickFiles={pmxPickFiles}
           pmxPickPaths={pmxPickPaths}
           pmxPickSelected={pmxPickSelected}
           onPmxPickSelectedChange={setPmxPickSelected}
           onConfirmPmxPick={onConfirmPmxPick}
           modelBones={sidebarBones}
-          clip={clip}
           selectedGroup={selectedGroup}
-          activeBone={activeBone}
+          selectedBone={selectedBone}
           onSelectGroup={handleSelectGroup}
           onSelectBone={handleSelectBone}
           morphNames={morphNames}
-          activeMorph={activeMorph}
+          selectedMorph={selectedMorph}
           onSelectMorph={handleSelectMorph}
           docsReadmeUrl={DOCS_README_URL}
           repoUrl={REPO_URL}
@@ -945,21 +1200,11 @@ export default function Home() {
 
         {/* Center: viewport + timeline */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <EditorViewport ref={canvasRef} engineError={engineError} />
+          <StudioViewport ref={canvasRef} engineError={engineError} />
           {/* Timeline with dopesheet + value graph */}
           <div className="h-[220px] shrink-0 border-t border-border">
             <Timeline
-              clip={clip}
-              setClip={setClip}
-              currentFrame={currentFrame}
-              setCurrentFrame={setCurrentFrame}
-              playing={playing}
-              setPlaying={setPlaying}
-              activeBone={activeBone}
               visibleBones={visibleBones}
-              selectedKeyframes={selectedKeyframes}
-              setSelectedKeyframes={setSelectedKeyframes}
-              activeMorph={activeMorph}
               clipVersion={clipVersion}
               tab={timelineTab}
               setTab={setTimelineTab}
@@ -967,7 +1212,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Right sidebar — properties for active bone / morph / keyframe context */}
+        {/* Right sidebar — properties for selected bone / morph / keyframe context */}
         <aside className="flex w-64 shrink-0 flex-col border-l border-sidebar-border text-sidebar-foreground">
           <div className="flex min-h-9 shrink-0 items-center border-b border-sidebar-border px-3 py-2">
             <span className="text-[11px] font-medium uppercase tracking-widest text-sidebar-foreground/70">
@@ -976,14 +1221,8 @@ export default function Home() {
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-2 text-[11px] [scrollbar-width:thin]">
             <PropertiesInspector
-              clip={clip}
-              currentFrame={currentFrame}
-              activeBone={activeBone}
-              activeMorph={activeMorph}
               morphWeight={morphWeightReadout}
-              selectedKeyframes={selectedKeyframes}
               modelRef={modelRef}
-              setClip={setClip}
               livePose={livePose}
               onInsertKeyframeAtPlayhead={insertKeyframeAtPlayhead}
               onDeleteSelectedKeyframes={deleteSelectedKeyframes}
@@ -995,7 +1234,7 @@ export default function Home() {
         </aside>
       </div>
 
-      <EditorStatusFooter
+      <StudioStatusFooter
         statusPmxFileName={statusPmxFileName}
         clipDisplayName={clipDisplayName}
         hasClip={clip != null}
@@ -1004,5 +1243,13 @@ export default function Home() {
         appVersion={APP_VERSION}
       />
     </div>
+  )
+}
+
+export default function Home() {
+  return (
+    <Studio>
+      <StudioPage />
+    </Studio>
   )
 }

@@ -13,7 +13,7 @@ interface BoneListProps {
   modelBones: string[]
   clip: AnimationClip | null
   selectedGroup: string
-  activeBone: string | null
+  selectedBone: string | null
   onSelectGroup: (group: string) => void
   onSelectBone: (bone: string) => void
 }
@@ -100,7 +100,7 @@ export const BoneList = memo(function BoneList({
   modelBones,
   clip,
   selectedGroup,
-  activeBone,
+  selectedBone,
   onSelectGroup,
   onSelectBone,
 }: BoneListProps) {
@@ -133,13 +133,13 @@ export const BoneList = memo(function BoneList({
             type: "bone",
             name: b,
             kfCount: clip?.boneTracks.get(b)?.length ?? 0,
-            isActive: activeBone === b,
+            isActive: selectedBone === b,
           })
         }
       }
     }
     return out
-  }, [modelBones, clip, selectedGroup, activeBone])
+  }, [modelBones, clip, selectedGroup, selectedBone])
 
   // Precompute offsets
   const { offsets, total } = useMemo(() => {

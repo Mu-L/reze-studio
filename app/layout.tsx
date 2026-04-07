@@ -15,7 +15,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Reze Studio",
-  description: "Reze Studio",
+  description: "Web-based MMD animation curve editor",
+  keywords: ["MMD", "animation", "curve editor", "WebGPU", "Reze Engine"],
 }
 
 export default function RootLayout({

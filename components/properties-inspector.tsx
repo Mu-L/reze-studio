@@ -1,11 +1,10 @@
 "use client"
 
-import type { Dispatch, RefObject, SetStateAction } from "react"
+import type { RefObject } from "react"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { AnimationClip, BoneInterpolation, BoneKeyframe, Model } from "reze-engine"
 import { Quat, Vec3 } from "reze-engine"
 import { Button } from "@/components/ui/button"
-import type { SelectedKeyframe } from "@/components/timeline"
 import {
   boneTitleSubtitle,
   eulerToQuat,
@@ -13,19 +12,59 @@ import {
   ROT_CHANNELS,
   TRA_CHANNELS,
 } from "@/lib/animation"
+import { AxisSliderRow } from "@/components/axis-slider-row"
+import { InterpolationCurveEditor, PRESETS, type CurvePoint } from "@/components/interpolation-curve-editor"
 import {
   cloneBoneInterpolation,
+  cn,
   readLocalPoseAfterSeek,
   upsertBoneKeyframeAtFrame,
   upsertMorphKeyframeAtFrame,
   VMD_LINEAR_DEFAULT_IP,
-} from "@/lib/keyframe-insert"
-import { AxisSliderRow } from "@/components/axis-slider-row"
-import { InterpolationCurveEditor, PRESETS, type CurvePoint } from "@/components/interpolation-curve-editor"
-import { cn } from "@/lib/utils"
+} from "@/lib/utils"
+import { useStudio } from "@/context/studio-context"
 
 /** Must match `loadClip` name in app/page (engine clip vs React state). */
 const STUDIO_ANIM_NAME = "studio"
+
+/** Curve tabs that show rotation channels — keys must match `components/timeline.tsx` TABS. */
+const ROT_TAB_KEYS = new Set<string>(["allRot", "rx", "ry", "rz"])
+const TRA_TAB_KEYS = new Set<string>(["allTra", "tx", "ty", "tz"])
+const ROT_AXIS_KEYS = ["rx", "ry", "rz"] as const
+const TRA_AXIS_KEYS = ["tx", "ty", "tz"] as const
+
+/** Off rotation group → All Rot; on RY/RZ but dragging X → RX (same for translation / All Trans). */
+function syncTimelineTabForRotationDrag(
+  currentTab: string,
+  axisIdx: 0 | 1 | 2,
+  setTimelineTab: (t: string) => void,
+) {
+  if (!ROT_TAB_KEYS.has(currentTab)) {
+    setTimelineTab("allRot")
+    return
+  }
+  if (currentTab === "allRot") return
+  const want = ROT_AXIS_KEYS[axisIdx]
+  if (currentTab !== want) setTimelineTab(want)
+}
+
+function syncTimelineTabForTranslationDrag(
+  currentTab: string,
+  axisIdx: 0 | 1 | 2,
+  setTimelineTab: (t: string) => void,
+) {
+  if (!TRA_TAB_KEYS.has(currentTab)) {
+    setTimelineTab("allTra")
+    return
+  }
+  if (currentTab === "allTra") return
+  const want = TRA_AXIS_KEYS[axisIdx]
+  if (currentTab !== want) setTimelineTab(want)
+}
+
+function syncTimelineTabForMorphDrag(currentTab: string, setTimelineTab: (t: string) => void) {
+  if (currentTab !== "morph") setTimelineTab("morph")
+}
 
 function sampleBoneKeyframe(clip: AnimationClip | null, boneName: string, frame: number) {
   if (!clip) return null
@@ -95,14 +134,8 @@ function interpolationTemplateForChannel(tab: IpTab): [CurvePoint, CurvePoint] {
 }
 
 interface PropertiesInspectorProps {
-  clip: AnimationClip | null
-  currentFrame: number
-  activeBone: string | null
-  activeMorph: string | null
   morphWeight: number | null
-  selectedKeyframes: SelectedKeyframe[]
   modelRef: RefObject<Model | null>
-  setClip: Dispatch<SetStateAction<AnimationClip | null>>
   livePose: {
     euler: { x: number; y: number; z: number }
     translation: Vec3
@@ -115,14 +148,8 @@ interface PropertiesInspectorProps {
 }
 
 export const PropertiesInspector = memo(function PropertiesInspector({
-  clip,
-  currentFrame,
-  activeBone,
-  activeMorph,
   morphWeight,
-  selectedKeyframes,
   modelRef,
-  setClip,
   livePose,
   onInsertKeyframeAtPlayhead,
   onDeleteSelectedKeyframes,
@@ -130,12 +157,13 @@ export const PropertiesInspector = memo(function PropertiesInspector({
   setTimelineTab,
   clipVersion,
 }: PropertiesInspectorProps) {
+  const { clip, commit, selectedBone, selectedMorph, selectedKeyframes, currentFrame } = useStudio()
   const fPlay = Math.round(currentFrame)
   const singleSel = selectedKeyframes.length === 1 ? selectedKeyframes[0] : null
   const multiSel = selectedKeyframes.length > 1
 
   const canDelete = clip && singleSel !== null
-  const canInsert = !!(clip && (activeBone || activeMorph))
+  const canInsert = !!(clip && (selectedBone || selectedMorph))
 
   const [ipTab, setIpTab] = useState<IpTab>("rot")
 
@@ -147,19 +175,8 @@ export const PropertiesInspector = memo(function PropertiesInspector({
     setIpTab("rot")
   }, [clipVersion])
 
-  // Auto-switch interpolation tab when a keyframe with a specific channel is selected.
-  useEffect(() => {
-    if (selectedKeyframes.length !== 1) return
-    const ch = selectedKeyframes[0].channel
-    if (!ch) return
-    if (ch === "rx" || ch === "ry" || ch === "rz") setIpTab("rot")
-    else if (ch === "tx") setIpTab("tx")
-    else if (ch === "ty") setIpTab("ty")
-    else if (ch === "tz") setIpTab("tz")
-  }, [selectedKeyframes])
-
   /** Last key at or before playhead — owns outgoing handles to the next key. */
-  const kfSample = clip && activeBone ? sampleBoneKeyframe(clip, activeBone, currentFrame) : null
+  const kfSample = clip && selectedBone ? sampleBoneKeyframe(clip, selectedBone, currentFrame) : null
 
   const ipPair = useMemo(() => {
     if (kfSample) {
@@ -171,19 +188,19 @@ export const PropertiesInspector = memo(function PropertiesInspector({
 
   const applyInterpolation = useCallback(
     (p1: CurvePoint, p2: CurvePoint) => {
-      if (!clip || !activeBone || !kfSample) return
+      if (!clip || !selectedBone || !kfSample) return
       const keyFrame = kfSample.frame
-      setClip(
-        patchKeyframeAt(clip, activeBone, keyFrame, (kf) => {
+      commit(
+        patchKeyframeAt(clip, selectedBone, keyFrame, (kf) => {
           kf.interpolation = mergeInterpolation(kf, ipTab, p1, p2)
         }),
       )
     },
-    [clip, activeBone, ipTab, kfSample, setClip],
+    [clip, selectedBone, ipTab, kfSample, commit],
   )
 
-  const showBoneStats = !!(activeBone && clip && !activeMorph && !multiSel)
-  const canEditIp = !!(clip && activeBone && kfSample)
+  const showBoneStats = !!(selectedBone && clip && !selectedMorph && !multiSel)
+  const canEditIp = !!(clip && selectedBone && kfSample)
 
   const ROT_RANGE = { min: -180, max: 180 }
   const TRA_RANGE = { min: -5, max: 5 }
@@ -191,9 +208,9 @@ export const PropertiesInspector = memo(function PropertiesInspector({
   const setRotationAxis = useCallback(
     (axisIdx: 0 | 1 | 2, v: number) => {
       const model = modelRef.current
-      if (!activeBone || !clip || !model) return
+      if (!selectedBone || !clip || !model) return
       const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
-      const atKey = findKeyframeAt(clip, activeBone, frame)
+      const atKey = findKeyframeAt(clip, selectedBone, frame)
       model.loadClip(STUDIO_ANIM_NAME, clip)
       model.seek(Math.max(0, currentFrame) / 30)
       let q: Quat
@@ -202,64 +219,64 @@ export const PropertiesInspector = memo(function PropertiesInspector({
         const e = quatToEuler(atKey.rotation)
         const next = axisIdx === 0 ? { ...e, x: v } : axisIdx === 1 ? { ...e, y: v } : { ...e, z: v }
         q = eulerToQuat(next.x, next.y, next.z)
-        setClip(patchKeyframeAt(clip, activeBone, frame, (kf) => { kf.rotation = q }))
+        commit(patchKeyframeAt(clip, selectedBone, frame, (kf) => { kf.rotation = q }))
       } else {
-        const pose = readLocalPoseAfterSeek(model, activeBone)
+        const pose = readLocalPoseAfterSeek(model, selectedBone)
         if (!pose) return
         const e = quatToEuler(pose.rotation)
         const next = axisIdx === 0 ? { ...e, x: v } : axisIdx === 1 ? { ...e, y: v } : { ...e, z: v }
         q = eulerToQuat(next.x, next.y, next.z)
-        setClip(upsertBoneKeyframeAtFrame(clip, activeBone, frame, q, pose.translation))
+        commit(upsertBoneKeyframeAtFrame(clip, selectedBone, frame, q, pose.translation))
       }
     },
-    [activeBone, clip, currentFrame, setClip],
+    [selectedBone, clip, currentFrame, commit],
   )
 
   const setTranslationAxis = useCallback(
     (axisIdx: 0 | 1 | 2, v: number) => {
       const model = modelRef.current
-      if (!activeBone || !clip || !model) return
+      if (!selectedBone || !clip || !model) return
       const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
-      const atKey = findKeyframeAt(clip, activeBone, frame)
+      const atKey = findKeyframeAt(clip, selectedBone, frame)
       model.loadClip(STUDIO_ANIM_NAME, clip)
       model.seek(Math.max(0, currentFrame) / 30)
       if (atKey) {
         const t = atKey.translation
         const next =
           axisIdx === 0 ? new Vec3(v, t.y, t.z) : axisIdx === 1 ? new Vec3(t.x, v, t.z) : new Vec3(t.x, t.y, v)
-        setClip(patchKeyframeAt(clip, activeBone, frame, (kf) => { kf.translation = next }))
+        commit(patchKeyframeAt(clip, selectedBone, frame, (kf) => { kf.translation = next }))
       } else {
-        const pose = readLocalPoseAfterSeek(model, activeBone)
+        const pose = readLocalPoseAfterSeek(model, selectedBone)
         if (!pose) return
         const t = pose.translation
         const next =
           axisIdx === 0 ? new Vec3(v, t.y, t.z) : axisIdx === 1 ? new Vec3(t.x, v, t.z) : new Vec3(t.x, t.y, v)
-        setClip(upsertBoneKeyframeAtFrame(clip, activeBone, frame, pose.rotation, next))
+        commit(upsertBoneKeyframeAtFrame(clip, selectedBone, frame, pose.rotation, next))
       }
     },
-    [activeBone, clip, currentFrame, setClip],
+    [selectedBone, clip, currentFrame, commit],
   )
 
   const setMorphWeightAtFrame = useCallback(
     (w: number) => {
-      if (!activeMorph || !clip) return
+      if (!selectedMorph || !clip) return
       const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
-      setClip(upsertMorphKeyframeAtFrame(clip, activeMorph, frame, w))
-      setTimelineTab("morph")
+      commit(upsertMorphKeyframeAtFrame(clip, selectedMorph, frame, w))
+      syncTimelineTabForMorphDrag(timelineTab, setTimelineTab)
     },
-    [activeMorph, clip, currentFrame, setClip, setTimelineTab],
+    [selectedMorph, clip, currentFrame, commit, timelineTab, setTimelineTab],
   )
 
   return (
     <div className="space-y-0 text-[11px] leading-relaxed text-inherit">
 
       {/* ─── Bone: sliders always; clip write updates key at playhead or inserts one ─── */}
-      {showBoneStats && activeBone ? (
+      {showBoneStats && selectedBone ? (
         <section className="border-b border-border pb-3">
           <div className="mb-2 flex items-start justify-between gap-2">
             <div>
               {(() => {
-                const { title, subtitle } = boneTitleSubtitle(activeBone)
+                const { title, subtitle } = boneTitleSubtitle(selectedBone)
                 return (
                   <>
                     <div className="text-xs font-semibold text-inherit">{title}</div>
@@ -287,8 +304,8 @@ export const PropertiesInspector = memo(function PropertiesInspector({
                 decimals={2}
                 disabled={!clip}
                 onChange={(v) => {
+                  syncTimelineTabForRotationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
                   setRotationAxis(i as 0 | 1 | 2, v)
-                  setTimelineTab(ch.key)
                 }}
               />
             ))
@@ -311,8 +328,8 @@ export const PropertiesInspector = memo(function PropertiesInspector({
                 decimals={3}
                 disabled={!clip}
                 onChange={(v) => {
+                  syncTimelineTabForTranslationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
                   setTranslationAxis(i as 0 | 1 | 2, v)
-                  setTimelineTab(ch.key)
                 }}
               />
             ))
@@ -383,11 +400,11 @@ export const PropertiesInspector = memo(function PropertiesInspector({
         </section>
       ) : null}
 
-      {activeMorph && clip && !multiSel ? (
+      {selectedMorph && clip && !multiSel ? (
         <section className="border-b border-border pb-3">
           <div className="mb-2 flex items-start justify-between gap-2">
             <div>
-              <div className="text-xs font-semibold text-inherit">{activeMorph}</div>
+              <div className="text-xs font-semibold text-inherit">{selectedMorph}</div>
             </div>
             <div className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
               F {fPlay}

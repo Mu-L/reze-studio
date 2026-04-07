@@ -15,7 +15,7 @@ Web-native MMD animation editor in the browser (WebGPU).
 - [x] Bone list with grouped hierarchy
 - [x] Morph list
 - [x] Keyboard shortcuts (Space, Arrow keys, Home/End)
-- [x] Session persistence (IndexedDB for animation data, localStorage for editor state)
+- [x] Unsaved-change warning on tab close / refresh (export VMD to keep your work)
 - [x] Rotation / translation sliders with direct numeric input
 - [x] Morph weight keyframing
 - [ ] Animation layers with blend weights and bone masks
