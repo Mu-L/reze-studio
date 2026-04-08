@@ -133,13 +133,136 @@ function interpolationTemplateForChannel(tab: IpTab): [CurvePoint, CurvePoint] {
   return [{ x: ip.translationZ[0].x, y: ip.translationZ[0].y }, { x: ip.translationZ[1].x, y: ip.translationZ[1].y }]
 }
 
+type LivePose = {
+  euler: { x: number; y: number; z: number }
+  translation: Vec3
+}
+
+function poseNearEqual(a: LivePose, b: LivePose, eps = 1e-5) {
+  return (
+    Math.abs(a.euler.x - b.euler.x) < eps &&
+    Math.abs(a.euler.y - b.euler.y) < eps &&
+    Math.abs(a.euler.z - b.euler.z) < eps &&
+    Math.abs(a.translation.x - b.translation.x) < eps &&
+    Math.abs(a.translation.y - b.translation.y) < eps &&
+    Math.abs(a.translation.z - b.translation.z) < eps
+  )
+}
+
+/** Samples the selected bone's pose and keeps it live:
+ *  - Paused: re-samples whenever currentFrame / clip / bone changes.
+ *  - Playing: rAF loop that reads straight from the engine (which owns the
+ *    clock). Scoped to the subcomponent that uses it so the rest of the
+ *    inspector does not reconcile at 60Hz. */
+function useLivePose(
+  modelRef: RefObject<Model | null>,
+  selectedBone: string | null,
+  clip: AnimationClip | null,
+): LivePose | null {
+  const playing = usePlaybackSelector((s) => s.playing)
+  const currentFrame = usePlaybackSelector((s) => s.currentFrame)
+  const playbackFrameRef = usePlaybackFrameRef()
+  const [livePose, setLivePose] = useState<LivePose | null>(null)
+
+  const sample = useCallback((): LivePose | null => {
+    const model = modelRef.current
+    if (!model || !selectedBone || !clip) return null
+    if (playing) {
+      // Engine owns the clock; runtimeSkeleton is already up-to-date. The
+      // store's playbackFrameRef is frozen during playback (engine-bridge
+      // writes the live frame into studio's *local* ref, not the store's),
+      // so we can't use it for the keyframe-snap lookup — and we don't need
+      // to: fractional playback frames rarely land on an exact keyframe, so
+      // just return the engine pose directly.
+      const p = readLocalPoseAfterSeek(model, selectedBone)
+      if (!p) return null
+      return { euler: quatToEuler(p.rotation), translation: p.translation }
+    }
+    // Paused path: React owns the clock — seek first, then prefer the stored
+    // keyframe at the current integer frame (bones under IK chains otherwise
+    // display the post-IK pose instead of the value that's in the keyframe).
+    const cf = playbackFrameRef.current
+    model.seek(Math.max(0, cf) / 30)
+    const p = readLocalPoseAfterSeek(model, selectedBone)
+    if (!p) return null
+    const frameInt = Math.round(Math.max(0, cf))
+    const kfAt = clip.boneTracks.get(selectedBone)?.find((k) => k.frame === frameInt)
+    return kfAt
+      ? { euler: quatToEuler(kfAt.rotation), translation: kfAt.translation }
+      : { euler: quatToEuler(p.rotation), translation: p.translation }
+  }, [modelRef, selectedBone, clip, playing, playbackFrameRef])
+
+  const apply = useCallback((next: LivePose | null) => {
+    setLivePose((prev) => {
+      if (prev === next) return prev
+      if (prev && next && poseNearEqual(prev, next)) return prev
+      return next
+    })
+  }, [])
+
+  // Paused path: resample on scrub / selection / clip edit.
+  useEffect(() => {
+    apply(sample())
+  }, [sample, currentFrame, apply])
+
+  // Playing path: rAF loop.
+  useEffect(() => {
+    if (!playing) return
+    let raf = 0
+    const tick = () => {
+      apply(sample())
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [playing, sample, apply])
+
+  return livePose
+}
+
+/** Reads the selected morph's current weight live. Same playing/paused split
+ *  as useLivePose so the morph slider tracks the playhead during playback. */
+function useLiveMorphWeight(
+  modelRef: RefObject<Model | null>,
+  selectedMorph: string | null,
+): number | null {
+  const playing = usePlaybackSelector((s) => s.playing)
+  const currentFrame = usePlaybackSelector((s) => s.currentFrame)
+  const [weight, setWeight] = useState<number | null>(null)
+
+  const sample = useCallback((): number | null => {
+    const model = modelRef.current
+    if (!model || !selectedMorph) return null
+    const morphing = model.getMorphing()
+    const idx = morphing.morphs.findIndex((m) => m.name === selectedMorph)
+    if (idx < 0) return null
+    return model.getMorphWeights()[idx] ?? null
+  }, [modelRef, selectedMorph])
+
+  const apply = useCallback((next: number | null) => {
+    setWeight((prev) => (prev === next ? prev : next))
+  }, [])
+
+  useEffect(() => {
+    apply(sample())
+  }, [sample, currentFrame, apply])
+
+  useEffect(() => {
+    if (!playing) return
+    let raf = 0
+    const tick = () => {
+      apply(sample())
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [playing, sample, apply])
+
+  return weight
+}
+
 interface PropertiesInspectorProps {
-  morphWeight: number | null
   modelRef: RefObject<Model | null>
-  livePose: {
-    euler: { x: number; y: number; z: number }
-    translation: Vec3
-  } | null
   onInsertKeyframeAtPlayhead: () => void
   onDeleteSelectedKeyframes: () => void
   timelineTab: string
@@ -148,9 +271,7 @@ interface PropertiesInspectorProps {
 }
 
 export const PropertiesInspector = memo(function PropertiesInspector({
-  morphWeight,
   modelRef,
-  livePose,
   onInsertKeyframeAtPlayhead,
   onDeleteSelectedKeyframes,
   timelineTab,
@@ -331,53 +452,17 @@ export const PropertiesInspector = memo(function PropertiesInspector({
             <PlayheadFrameLabel frameCount={clip?.frameCount ?? null} />
           </div>
 
-          <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Rotation (°)</div>
-          {livePose ? (
-            ROT_CHANNELS.map((ch, i) => (
-              <AxisSliderRow
-                key={ch.key}
-                axis={["X", "Y", "Z"][i] as string}
-                color={ch.color}
-                value={[livePose.euler.x, livePose.euler.y, livePose.euler.z][i]}
-                min={ROT_RANGE.min}
-                max={ROT_RANGE.max}
-                decimals={2}
-                disabled={!clip}
-                onChange={(v) => {
-                  syncTimelineTabForRotationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
-                  applyRotationAxis(i as 0 | 1 | 2, v, "preview")
-                }}
-                onCommit={(v) => applyRotationAxis(i as 0 | 1 | 2, v, "commit")}
-              />
-            ))
-          ) : (
-            <div className="text-[11px] text-muted-foreground">—</div>
-          )}
-
-          <div className="mb-2 mt-3 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
-            Translation
-          </div>
-          {livePose ? (
-            TRA_CHANNELS.map((ch, i) => (
-              <AxisSliderRow
-                key={ch.key}
-                axis={["X", "Y", "Z"][i] as string}
-                color={ch.color}
-                value={[livePose.translation.x, livePose.translation.y, livePose.translation.z][i]}
-                min={TRA_RANGE.min}
-                max={TRA_RANGE.max}
-                decimals={3}
-                disabled={!clip}
-                onChange={(v) => {
-                  syncTimelineTabForTranslationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
-                  applyTranslationAxis(i as 0 | 1 | 2, v, "preview")
-                }}
-                onCommit={(v) => applyTranslationAxis(i as 0 | 1 | 2, v, "commit")}
-              />
-            ))
-          ) : (
-            <div className="text-[11px] text-muted-foreground">—</div>
-          )}
+          <LiveBoneSliders
+            modelRef={modelRef}
+            selectedBone={selectedBone}
+            clip={clip}
+            timelineTab={timelineTab}
+            setTimelineTab={setTimelineTab}
+            applyRotationAxis={applyRotationAxis}
+            applyTranslationAxis={applyTranslationAxis}
+            rotRange={ROT_RANGE}
+            traRange={TRA_RANGE}
+          />
 
           <InterpolationSection
             clip={clip}
@@ -397,16 +482,11 @@ export const PropertiesInspector = memo(function PropertiesInspector({
             <PlayheadFrameLabel frameCount={clip?.frameCount ?? null} />
           </div>
           <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Weight</div>
-          <AxisSliderRow
-            axis="W"
-            color="#c084fc"
-            value={morphWeight ?? 0}
-            min={0}
-            max={1}
-            decimals={2}
+          <LiveMorphSlider
+            modelRef={modelRef}
+            selectedMorph={selectedMorph}
             disabled={!clip}
-            onChange={(v) => applyMorphWeight(v, "preview")}
-            onCommit={(v) => applyMorphWeight(v, "commit")}
+            applyMorphWeight={applyMorphWeight}
           />
         </section>
       ) : null}
@@ -439,6 +519,114 @@ export const PropertiesInspector = memo(function PropertiesInspector({
     </div>
   )
 })
+
+/** Rotation + translation sliders for the selected bone. Isolated from the
+ *  parent inspector so its internal useLivePose hook (which rAFs during
+ *  playback and subscribes to currentFrame while paused) only reconciles
+ *  this subtree — the sliders themselves — not the rest of the inspector. */
+function LiveBoneSliders({
+  modelRef,
+  selectedBone,
+  clip,
+  timelineTab,
+  setTimelineTab,
+  applyRotationAxis,
+  applyTranslationAxis,
+  rotRange,
+  traRange,
+}: {
+  modelRef: RefObject<Model | null>
+  selectedBone: string | null
+  clip: AnimationClip | null
+  timelineTab: string
+  setTimelineTab: (t: string) => void
+  applyRotationAxis: (axisIdx: 0 | 1 | 2, v: number, mode: "preview" | "commit") => void
+  applyTranslationAxis: (axisIdx: 0 | 1 | 2, v: number, mode: "preview" | "commit") => void
+  rotRange: { min: number; max: number }
+  traRange: { min: number; max: number }
+}) {
+  const livePose = useLivePose(modelRef, selectedBone, clip)
+  return (
+    <>
+      <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Rotation (°)</div>
+      {livePose ? (
+        ROT_CHANNELS.map((ch, i) => (
+          <AxisSliderRow
+            key={ch.key}
+            axis={["X", "Y", "Z"][i] as string}
+            color={ch.color}
+            value={[livePose.euler.x, livePose.euler.y, livePose.euler.z][i]}
+            min={rotRange.min}
+            max={rotRange.max}
+            decimals={2}
+            disabled={!clip}
+            onChange={(v) => {
+              syncTimelineTabForRotationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
+              applyRotationAxis(i as 0 | 1 | 2, v, "preview")
+            }}
+            onCommit={(v) => applyRotationAxis(i as 0 | 1 | 2, v, "commit")}
+          />
+        ))
+      ) : (
+        <div className="text-[11px] text-muted-foreground">—</div>
+      )}
+
+      <div className="mb-2 mt-3 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+        Translation
+      </div>
+      {livePose ? (
+        TRA_CHANNELS.map((ch, i) => (
+          <AxisSliderRow
+            key={ch.key}
+            axis={["X", "Y", "Z"][i] as string}
+            color={ch.color}
+            value={[livePose.translation.x, livePose.translation.y, livePose.translation.z][i]}
+            min={traRange.min}
+            max={traRange.max}
+            decimals={3}
+            disabled={!clip}
+            onChange={(v) => {
+              syncTimelineTabForTranslationDrag(timelineTab, i as 0 | 1 | 2, setTimelineTab)
+              applyTranslationAxis(i as 0 | 1 | 2, v, "preview")
+            }}
+            onCommit={(v) => applyTranslationAxis(i as 0 | 1 | 2, v, "commit")}
+          />
+        ))
+      ) : (
+        <div className="text-[11px] text-muted-foreground">—</div>
+      )}
+    </>
+  )
+}
+
+/** Morph weight slider scoped to its own rAF subscription — mirrors
+ *  <LiveBoneSliders>. */
+function LiveMorphSlider({
+  modelRef,
+  selectedMorph,
+  disabled,
+  applyMorphWeight,
+}: {
+  modelRef: RefObject<Model | null>
+  selectedMorph: string | null
+  disabled: boolean
+  applyMorphWeight: (w: number, mode: "preview" | "commit") => void
+}) {
+  const weight = useLiveMorphWeight(modelRef, selectedMorph)
+  return (
+    <AxisSliderRow
+      axis="W"
+      color="#c084fc"
+      value={weight ?? 0}
+      min={0}
+      max={1}
+      decimals={2}
+      disabled={disabled}
+      onChange={(v) => applyMorphWeight(v, "preview")}
+      onCommit={(v) => applyMorphWeight(v, "commit")}
+    />
+  )
+}
 
 /** Subscribes to the playhead so the parent <PropertiesInspector/> doesn't have to. */
 function PlayheadFrameLabel({ frameCount }: { frameCount: number | null }) {

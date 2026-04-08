@@ -97,18 +97,6 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url)
 }
 
-/** Reuse `livePose` object when floats haven’t moved — keeps memo’d Properties from reconciling every RAF. */
-function poseNearEqual(a: { euler: { x: number; y: number; z: number }; translation: Vec3 }, b: typeof a, eps = 1e-5) {
-  return (
-    Math.abs(a.euler.x - b.euler.x) < eps &&
-    Math.abs(a.euler.y - b.euler.y) < eps &&
-    Math.abs(a.euler.z - b.euler.z) < eps &&
-    Math.abs(a.translation.x - b.translation.x) < eps &&
-    Math.abs(a.translation.y - b.translation.y) < eps &&
-    Math.abs(a.translation.z - b.translation.z) < eps
-  )
-}
-
 /** Canvas + error overlay — playhead updates won’t reconcile this subtree. */
 const StudioViewport = memo(
   forwardRef<HTMLCanvasElement, { engineError: string | null }>(function StudioViewport({ engineError }, ref) {
@@ -443,11 +431,6 @@ export function StudioPage() {
   const clipRef = useRef<AnimationClip | null>(null)
   const currentFrameRef = useRef(0)
   const clipDisplayNameRef = useRef("clip")
-  const livePoseStableRef = useRef<{
-    euler: { x: number; y: number; z: number }
-    translation: Vec3
-  } | null>(null)
-
   const visibleBones = useMemo(() => {
     const g = BONE_GROUPS[selectedGroup]
     if (!g) return clipBones
@@ -632,45 +615,6 @@ export function StudioPage() {
       return { ...prev, boneTracks }
     })
   }, [clip, selectedKeyframes, timelineTab, selectedMorph, commit, setSelectedKeyframes])
-
-  const livePose = useMemo(() => {
-    const model = modelRef.current
-    if (!model || !selectedBone || !clip) {
-      livePoseStableRef.current = null
-      return null
-    }
-    // Engine is already at the right time: while playing it advances itself,
-    // while paused the scrub effect above has seeked it. No loadClip — that's
-    // edit-only now (see useEffect([clip])).
-    if (!playing) {
-      model.seek(Math.max(0, currentFrame) / 30)
-    }
-    const p = readLocalPoseAfterSeek(model, selectedBone)
-    if (!p) {
-      livePoseStableRef.current = null
-      return null
-    }
-    // Prefer the stored keyframe value at the current frame when one exists:
-    // the runtime skeleton returns the post-IK / post-constraint rotation, so
-    // bones under an IK chain would otherwise display a different value than
-    // what's actually stored in the keyframe (and what the timeline shows).
-    const frameInt = Math.round(Math.max(0, currentFrame))
-    const boneTrack = clip.boneTracks.get(selectedBone)
-    const kfAt = boneTrack?.find((k) => k.frame === frameInt)
-    const next = kfAt
-      ? {
-          euler: quatToEuler(kfAt.rotation),
-          translation: kfAt.translation,
-        }
-      : {
-          euler: quatToEuler(p.rotation),
-          translation: p.translation,
-        }
-    const prev = livePoseStableRef.current
-    if (prev && poseNearEqual(prev, next)) return prev
-    livePoseStableRef.current = next
-    return next
-  }, [currentFrame, clip, selectedBone, playing])
 
   const insertKeyframeAtPlayhead = useCallback(() => {
     const model = modelRef.current
@@ -991,9 +935,7 @@ export function StudioPage() {
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-2 text-[11px] [scrollbar-width:thin]">
             <PropertiesInspector
-              morphWeight={morphWeightReadout}
               modelRef={modelRef}
-              livePose={livePose}
               onInsertKeyframeAtPlayhead={insertKeyframeAtPlayhead}
               onDeleteSelectedKeyframes={deleteSelectedKeyframes}
               timelineTab={timelineTab}
