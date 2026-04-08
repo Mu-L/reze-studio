@@ -501,7 +501,6 @@ function StudioPage() {
   const lastReportedEngineFpsRef = useRef<number | null>(null)
 
   const playRef = useRef(false)
-  const lastT = useRef<number | null>(null)
   /** Snapshotted before async PMX swap so clip/playhead survive `await loadModel`. */
   const clipRef = useRef<AnimationClip | null>(null)
   const currentFrameRef = useRef(0)
@@ -552,38 +551,29 @@ function StudioPage() {
   }, [])
 
   // ─── Playback loop ───────────────────────────────────────────────────
+  // While playing, the engine owns the timeline (advances pose every render).
+  // React's job is to MIRROR the engine's clock into `currentFrame` so the UI
+  // (timeline playhead, readouts) stays in sync — not to drive it. No dt math,
+  // no double-seek.
   useEffect(() => {
     playRef.current = playing
-    if (!playing) {
-      lastT.current = null
-      return
-    }
-    if (frameCount <= 0) {
-      lastT.current = null
-      return
-    }
+    if (!playing) return
+    if (frameCount <= 0) return
+    const model = modelRef.current
+    if (!model) return
     let raf: number
-    const tick = (ts: number) => {
+    const tick = () => {
       if (!playRef.current) return
-      const prevT = lastT.current
-      lastT.current = ts
-      if (prevT === null) {
-        raf = requestAnimationFrame(tick)
-        return
-      }
-      let hitEnd = false
-      setCurrentFrame((p) => {
-        const n = p + ((ts - prevT) / 1000) * 30
-        if (n >= frameCount) {
-          hitEnd = true
-          return frameCount
-        }
-        return n
-      })
-      if (hitEnd) {
+      const m = modelRef.current
+      if (!m) return
+      const progress = m.getAnimationProgress()
+      const frame = progress.current * 30
+      if (frame >= frameCount) {
+        setCurrentFrame(frameCount)
         setPlaying(false)
         return
       }
+      setCurrentFrame(frame)
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
@@ -742,12 +732,25 @@ function StudioPage() {
     }
   }, [commit, setClipDisplayName, setSelectedMorph])
 
-  // Match timeline canvas: seek before paint so viewport and playhead don’t disagree for a frame.
-  useLayoutEffect(() => {
+  // Upload clip to engine ONLY on edits — never on playhead movement. After upload
+  // we re-seek the engine to the current React frame so a commit during pause
+  // doesn't snap the viewport back to frame 0.
+  useEffect(() => {
     const model = modelRef.current
     if (!model || !clip) return
     model.loadClip(STUDIO_ANIM_NAME, clip)
-    model.seek(Math.max(0, currentFrame) / 30)
+    model.seek(Math.max(0, currentFrameRef.current) / 30)
+  }, [clip])
+
+  // Scrub: when paused, React owns the playhead and pushes seeks into the engine.
+  // When playing, the engine owns the playhead — we read FROM it via the rAF loop
+  // below and must NOT seek here (would fight the engine's own timeline).
+  useLayoutEffect(() => {
+    const model = modelRef.current
+    if (!model || !clip) return
+    if (!playing) {
+      model.seek(Math.max(0, currentFrame) / 30)
+    }
     if (!selectedMorph) {
       setMorphWeightReadout(null)
       return
@@ -760,23 +763,26 @@ function StudioPage() {
     }
     const w = model.getMorphWeights()[idx]
     setMorphWeightReadout((prev) => (prev === w ? prev : w))
-  }, [currentFrame, clip, selectedMorph])
+  }, [currentFrame, clip, selectedMorph, playing])
 
   useEffect(() => {
     const model = modelRef.current
     if (!model || !clip) return
     if (playing) {
+      // Make sure the engine starts from the React playhead. If the user pressed
+      // play at the end, rewind to 0 first (and mirror that into React state).
+      let startFrame = currentFrameRef.current
+      if (startFrame >= frameCount) {
+        startFrame = 0
+        setCurrentFrame(0)
+      }
+      model.seek(Math.max(0, startFrame) / 30)
       model.play()
       if (model.name === "reze") {
         model.setMorphWeight("抗穿模", 0.5)
       }
     } else model.pause()
-  }, [playing, clip])
-
-  useEffect(() => {
-    if (!playing || frameCount <= 0) return
-    if (currentFrame >= frameCount) setCurrentFrame(0)
-  }, [playing, currentFrame, frameCount, setCurrentFrame])
+  }, [playing, clip, frameCount, setCurrentFrame])
 
   useEffect(() => {
     setCurrentFrame((c) => Math.min(c, frameCount))
@@ -868,9 +874,12 @@ function StudioPage() {
       livePoseStableRef.current = null
       return null
     }
-    // React clip can fork from the engine’s internal clip; push state back before seek/read so sliders stay in sync
-    model.loadClip(STUDIO_ANIM_NAME, clip)
-    model.seek(Math.max(0, currentFrame) / 30)
+    // Engine is already at the right time: while playing it advances itself,
+    // while paused the scrub effect above has seeked it. No loadClip — that's
+    // edit-only now (see useEffect([clip])).
+    if (!playing) {
+      model.seek(Math.max(0, currentFrame) / 30)
+    }
     const p = readLocalPoseAfterSeek(model, selectedBone)
     if (!p) {
       livePoseStableRef.current = null
@@ -896,7 +905,7 @@ function StudioPage() {
     if (prev && poseNearEqual(prev, next)) return prev
     livePoseStableRef.current = next
     return next
-  }, [currentFrame, clip, selectedBone])
+  }, [currentFrame, clip, selectedBone, playing])
 
   const insertKeyframeAtPlayhead = useCallback(() => {
     const model = modelRef.current

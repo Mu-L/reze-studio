@@ -23,7 +23,7 @@ import {
   VMD_LINEAR_DEFAULT_IP,
 } from "@/lib/utils"
 import { useStudio } from "@/context/studio-context"
-import { usePlayback } from "@/context/playback-context"
+import { usePlayback, usePlaybackFrameRef } from "@/context/playback-context"
 
 /** Must match `loadClip` name in app/page (engine clip vs React state). */
 const STUDIO_ANIM_NAME = "studio"
@@ -159,50 +159,18 @@ export const PropertiesInspector = memo(function PropertiesInspector({
   clipVersion,
 }: PropertiesInspectorProps) {
   const { clip, commit, selectedBone, selectedMorph, selectedKeyframes } = useStudio()
-  const { currentFrame } = usePlayback()
-  const fPlay = Math.round(currentFrame)
+  /** Read-only ref to the playhead. Subscribing here would re-render Properties
+   *  every rAF tick during playback; instead we read .current inside callbacks
+   *  and let the small <PlayheadFrameLabel/> + <InterpolationSection/> children
+   *  subscribe for the handful of visible bits that actually need to update. */
+  const playbackFrameRef = usePlaybackFrameRef()
   const singleSel = selectedKeyframes.length === 1 ? selectedKeyframes[0] : null
   const multiSel = selectedKeyframes.length > 1
 
   const canDelete = clip && singleSel !== null
   const canInsert = !!(clip && (selectedBone || selectedMorph))
 
-  const [ipTab, setIpTab] = useState<IpTab>("rot")
-
-  // Reset interpolation tab when a new clip is loaded.
-  const clipVersionRef = useRef(clipVersion)
-  useEffect(() => {
-    if (clipVersionRef.current === clipVersion) return
-    clipVersionRef.current = clipVersion
-    setIpTab("rot")
-  }, [clipVersion])
-
-  /** Last key at or before playhead — owns outgoing handles to the next key. */
-  const kfSample = clip && selectedBone ? sampleBoneKeyframe(clip, selectedBone, currentFrame) : null
-
-  const ipPair = useMemo(() => {
-    if (kfSample) {
-      const p = interpolationPairFromTab(kfSample, ipTab)
-      if (p) return p
-    }
-    return interpolationTemplateForChannel(ipTab)
-  }, [clip, kfSample, ipTab])
-
-  const applyInterpolation = useCallback(
-    (p1: CurvePoint, p2: CurvePoint) => {
-      if (!clip || !selectedBone || !kfSample) return
-      const keyFrame = kfSample.frame
-      commit(
-        patchKeyframeAt(clip, selectedBone, keyFrame, (kf) => {
-          kf.interpolation = mergeInterpolation(kf, ipTab, p1, p2)
-        }),
-      )
-    },
-    [clip, selectedBone, ipTab, kfSample, commit],
-  )
-
   const showBoneStats = !!(selectedBone && clip && !selectedMorph && !multiSel)
-  const canEditIp = !!(clip && selectedBone && kfSample)
 
   const ROT_RANGE = { min: -180, max: 180 }
   const TRA_RANGE = { min: -5, max: 5 }
@@ -211,10 +179,11 @@ export const PropertiesInspector = memo(function PropertiesInspector({
     (axisIdx: 0 | 1 | 2, v: number) => {
       const model = modelRef.current
       if (!selectedBone || !clip || !model) return
-      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
+      const cf = playbackFrameRef.current
+      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, cf)))
       const atKey = findKeyframeAt(clip, selectedBone, frame)
       model.loadClip(STUDIO_ANIM_NAME, clip)
-      model.seek(Math.max(0, currentFrame) / 30)
+      model.seek(Math.max(0, cf) / 30)
       let q: Quat
       if (atKey) {
         // Other euler components from stored key, not blended pose (avoids sibling axes drifting)
@@ -231,17 +200,18 @@ export const PropertiesInspector = memo(function PropertiesInspector({
         commit(upsertBoneKeyframeAtFrame(clip, selectedBone, frame, q, pose.translation))
       }
     },
-    [selectedBone, clip, currentFrame, commit],
+    [selectedBone, clip, commit, playbackFrameRef],
   )
 
   const setTranslationAxis = useCallback(
     (axisIdx: 0 | 1 | 2, v: number) => {
       const model = modelRef.current
       if (!selectedBone || !clip || !model) return
-      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
+      const cf = playbackFrameRef.current
+      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, cf)))
       const atKey = findKeyframeAt(clip, selectedBone, frame)
       model.loadClip(STUDIO_ANIM_NAME, clip)
-      model.seek(Math.max(0, currentFrame) / 30)
+      model.seek(Math.max(0, cf) / 30)
       if (atKey) {
         const t = atKey.translation
         const next =
@@ -256,17 +226,17 @@ export const PropertiesInspector = memo(function PropertiesInspector({
         commit(upsertBoneKeyframeAtFrame(clip, selectedBone, frame, pose.rotation, next))
       }
     },
-    [selectedBone, clip, currentFrame, commit],
+    [selectedBone, clip, commit, playbackFrameRef],
   )
 
   const setMorphWeightAtFrame = useCallback(
     (w: number) => {
       if (!selectedMorph || !clip) return
-      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, currentFrame)))
+      const frame = Math.round(Math.max(0, Math.min(clip.frameCount, playbackFrameRef.current)))
       commit(upsertMorphKeyframeAtFrame(clip, selectedMorph, frame, w))
       syncTimelineTabForMorphDrag(timelineTab, setTimelineTab)
     },
-    [selectedMorph, clip, currentFrame, commit, timelineTab, setTimelineTab],
+    [selectedMorph, clip, commit, timelineTab, setTimelineTab, playbackFrameRef],
   )
 
   return (
@@ -287,10 +257,7 @@ export const PropertiesInspector = memo(function PropertiesInspector({
                 )
               })()}
             </div>
-            <div className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-              F {fPlay}
-              {clip ? ` / ${clip.frameCount}` : ""}
-            </div>
+            <PlayheadFrameLabel frameCount={clip?.frameCount ?? null} />
           </div>
 
           <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Rotation (°)</div>
@@ -339,66 +306,12 @@ export const PropertiesInspector = memo(function PropertiesInspector({
             <div className="text-[11px] text-muted-foreground">—</div>
           )}
 
-          <div className="mb-2 mt-3 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
-            Interpolation
-          </div>
-          <div className="mb-1.5 flex flex-wrap gap-0.5">
-            {(
-              [
-                ["rot", "Rotation"],
-                ["tx", "Trans X"],
-                ["ty", "Trans Y"],
-                ["tz", "Trans Z"],
-              ] as const
-            ).map(([key, label]) => (
-              <Button
-                key={key}
-                type="button"
-                variant={ipTab === key ? "secondary" : "ghost"}
-                size="xs"
-                disabled={!canEditIp}
-                onClick={() => setIpTab(key)}
-                className="h-6 px-2 text-[9px] font-medium"
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-          <div className="flex items-stretch gap-1.5" style={{ height: 164 }}>
-            <InterpolationCurveEditor
-              p1={ipPair[0]}
-              p2={ipPair[1]}
-              disabled={!canEditIp}
-              onChange={applyInterpolation}
-            />
-            <div className="flex min-w-0 flex-1 flex-col gap-1">
-              {PRESETS.map((pr) => {
-                const active =
-                  pr.p1.x === ipPair[0].x &&
-                  pr.p1.y === ipPair[0].y &&
-                  pr.p2.x === ipPair[1].x &&
-                  pr.p2.y === ipPair[1].y
-                return (
-                  <Button
-                    key={pr.label}
-                    type="button"
-                    variant={active ? "secondary" : "outline"}
-                    size="xs"
-                    disabled={!canEditIp}
-                    onClick={() => applyInterpolation(pr.p1, pr.p2)}
-                    className={cn(
-                      "h-auto min-h-0 flex-1 truncate px-1 py-0.5 text-center text-[9.5px] font-medium leading-tight",
-                      active
-                        ? "border-primary/30 text-primary"
-                        : "text-muted-foreground hover:border-primary/25 hover:text-accent-foreground",
-                    )}
-                  >
-                    {pr.label}
-                  </Button>
-                )
-              })}
-            </div>
-          </div>
+          <InterpolationSection
+            clip={clip}
+            selectedBone={selectedBone}
+            commit={commit}
+            clipVersion={clipVersion}
+          />
         </section>
       ) : null}
 
@@ -408,10 +321,7 @@ export const PropertiesInspector = memo(function PropertiesInspector({
             <div>
               <div className="text-xs font-semibold text-inherit">{selectedMorph}</div>
             </div>
-            <div className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-              F {fPlay}
-              {clip ? ` / ${clip.frameCount}` : ""}
-            </div>
+            <PlayheadFrameLabel frameCount={clip?.frameCount ?? null} />
           </div>
           <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">Weight</div>
           <AxisSliderRow
@@ -455,3 +365,129 @@ export const PropertiesInspector = memo(function PropertiesInspector({
     </div>
   )
 })
+
+/** Subscribes to the playhead so the parent <PropertiesInspector/> doesn't have to. */
+function PlayheadFrameLabel({ frameCount }: { frameCount: number | null }) {
+  const { currentFrame } = usePlayback()
+  return (
+    <div className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+      F {Math.round(currentFrame)}
+      {frameCount != null ? ` / ${frameCount}` : ""}
+    </div>
+  )
+}
+
+/** Owns the interpolation tab + curve preview. Subscribes to currentFrame
+ *  internally so the parent inspector (and its sliders) don't re-render every
+ *  rAF tick during playback. */
+function InterpolationSection({
+  clip,
+  selectedBone,
+  commit,
+  clipVersion,
+}: {
+  clip: AnimationClip | null
+  selectedBone: string | null
+  commit: ReturnType<typeof useStudio>["commit"]
+  clipVersion: number
+}) {
+  const { currentFrame } = usePlayback()
+  const [ipTab, setIpTab] = useState<IpTab>("rot")
+
+  // Reset interpolation tab when a new clip is loaded.
+  const clipVersionRef = useRef(clipVersion)
+  useEffect(() => {
+    if (clipVersionRef.current === clipVersion) return
+    clipVersionRef.current = clipVersion
+    setIpTab("rot")
+  }, [clipVersion])
+
+  const kfSample = clip && selectedBone ? sampleBoneKeyframe(clip, selectedBone, currentFrame) : null
+  const canEditIp = !!(clip && selectedBone && kfSample)
+
+  const ipPair = useMemo(() => {
+    if (kfSample) {
+      const p = interpolationPairFromTab(kfSample, ipTab)
+      if (p) return p
+    }
+    return interpolationTemplateForChannel(ipTab)
+  }, [kfSample, ipTab])
+
+  const applyInterpolation = useCallback(
+    (p1: CurvePoint, p2: CurvePoint) => {
+      if (!clip || !selectedBone || !kfSample) return
+      const keyFrame = kfSample.frame
+      commit(
+        patchKeyframeAt(clip, selectedBone, keyFrame, (kf) => {
+          kf.interpolation = mergeInterpolation(kf, ipTab, p1, p2)
+        }),
+      )
+    },
+    [clip, selectedBone, ipTab, kfSample, commit],
+  )
+
+  return (
+    <>
+      <div className="mb-2 mt-3 text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+        Interpolation
+      </div>
+      <div className="mb-1.5 flex flex-wrap gap-0.5">
+        {(
+          [
+            ["rot", "Rotation"],
+            ["tx", "Trans X"],
+            ["ty", "Trans Y"],
+            ["tz", "Trans Z"],
+          ] as const
+        ).map(([key, label]) => (
+          <Button
+            key={key}
+            type="button"
+            variant={ipTab === key ? "secondary" : "ghost"}
+            size="xs"
+            disabled={!canEditIp}
+            onClick={() => setIpTab(key)}
+            className="h-6 px-2 text-[9px] font-medium"
+          >
+            {label}
+          </Button>
+        ))}
+      </div>
+      <div className="flex items-stretch gap-1.5" style={{ height: 164 }}>
+        <InterpolationCurveEditor
+          p1={ipPair[0]}
+          p2={ipPair[1]}
+          disabled={!canEditIp}
+          onChange={applyInterpolation}
+        />
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          {PRESETS.map((pr) => {
+            const active =
+              pr.p1.x === ipPair[0].x &&
+              pr.p1.y === ipPair[0].y &&
+              pr.p2.x === ipPair[1].x &&
+              pr.p2.y === ipPair[1].y
+            return (
+              <Button
+                key={pr.label}
+                type="button"
+                variant={active ? "secondary" : "outline"}
+                size="xs"
+                disabled={!canEditIp}
+                onClick={() => applyInterpolation(pr.p1, pr.p2)}
+                className={cn(
+                  "h-auto min-h-0 flex-1 truncate px-1 py-0.5 text-center text-[9.5px] font-medium leading-tight",
+                  active
+                    ? "border-primary/30 text-primary"
+                    : "text-muted-foreground hover:border-primary/25 hover:text-accent-foreground",
+                )}
+              >
+                {pr.label}
+              </Button>
+            )
+          })}
+        </div>
+      </div>
+    </>
+  )
+}

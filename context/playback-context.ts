@@ -9,7 +9,9 @@ import {
   useContext,
   useMemo,
   useReducer,
+  useRef,
   type Dispatch,
+  type MutableRefObject,
   type ReactNode,
   type SetStateAction,
 } from "react"
@@ -61,8 +63,18 @@ type PlaybackContextValue = {
 
 const PlaybackContext = createContext<PlaybackContextValue | null>(null)
 
+/** Separate context whose value is a stable ref to the latest currentFrame.
+ *  Consumers that only need to *read* the playhead at call time (e.g. inside
+ *  callbacks) subscribe to this instead of `PlaybackContext`, so they don't
+ *  re-render every rAF tick during playback. */
+type PlaybackRefContextValue = { currentFrameRef: MutableRefObject<number> }
+const PlaybackRefContext = createContext<PlaybackRefContextValue | null>(null)
+
 export function Playback({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(playbackReducer, initialPlaybackState)
+  const currentFrameRef = useRef(state.currentFrame)
+  currentFrameRef.current = state.currentFrame
+  const refValue = useMemo<PlaybackRefContextValue>(() => ({ currentFrameRef }), [])
 
   const setCurrentFrame = useCallback((payload: SetStateAction<number>) => {
     dispatch({ type: "SET_CURRENT_FRAME", payload })
@@ -82,11 +94,25 @@ export function Playback({ children }: { children: ReactNode }) {
     [state.currentFrame, state.playing, setCurrentFrame, setPlaying],
   )
 
-  return createElement(PlaybackContext.Provider, { value }, children)
+  return createElement(
+    PlaybackRefContext.Provider,
+    { value: refValue },
+    createElement(PlaybackContext.Provider, { value }, children),
+  )
 }
 
 export function usePlayback(): PlaybackContextValue {
   const ctx = useContext(PlaybackContext)
   if (ctx == null) throw new Error("usePlayback must be used within <Playback>")
   return ctx
+}
+
+/** Read-only, non-subscribing access to the latest playhead. The returned ref
+ *  identity is stable for the lifetime of <Playback>, so consuming this hook
+ *  will NOT cause a re-render when the playhead moves. Use `.current` inside
+ *  callbacks / effects, never in render. */
+export function usePlaybackFrameRef(): MutableRefObject<number> {
+  const ctx = useContext(PlaybackRefContext)
+  if (ctx == null) throw new Error("usePlaybackFrameRef must be used within <Playback>")
+  return ctx.currentFrameRef
 }
