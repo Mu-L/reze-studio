@@ -21,7 +21,7 @@ import { usePlayback } from "@/context/playback-context"
 import { useStudioStatusActions } from "@/components/studio-status"
 
 // ─── Constants shared with StudioPage file handlers ──────────────────────
-export const MODEL_PATH = "/models/reze/reze.pmx"
+export const MODEL_PATH = "/models/塞尔凯特/塞尔凯特.pmx"
 export const VMD_PATH = "/animations/miku.vmd"
 export const STUDIO_ANIM_NAME = "studio"
 export const BUNDLED_PMX_FILENAME = MODEL_PATH.replace(/^.*\//, "") || "model.pmx"
@@ -89,9 +89,12 @@ export function EngineBridge({
     async function initEngine() {
       try {
         const engine = new Engine(el, {
-          ambientColor: new Vec3(0.86, 0.84, 0.88),
-          cameraDistance: 31.5,
-          cameraTarget: new Vec3(0, 11.5, 0),
+          camera: {
+            distance: 31.5,
+            target: new Vec3(0, 11.5, 0),
+            
+          },
+        bloom:{color: new Vec3(1, 0.1, 0.88)},
         })
         await engine.init()
         if (disposed) return
@@ -106,7 +109,38 @@ export function EngineBridge({
           setMorphNames(model.getMorphing().morphs.map((m) => m.name))
           setStatusPmxFileName(BUNDLED_PMX_FILENAME)
           model.setMorphWeight("抗穿模", 0.5)
-          engine.addGround({ diffuseColor: new Vec3(0.14, 0.12, 0.16) })
+
+          engine.setMaterialPresets("reze", {
+            eye: ["眼睛", "眼白", "目白", "右瞳","左瞳"],
+            face: ["脸", "face01"],
+            body: ["皮肤", "skin"],
+            hair: ["头发", "hair_f"],
+            cloth_smooth: [
+              "衣服",
+              "裙子",
+              "裙带",
+              "裙布",
+              "外套",
+              "外套饰",
+              "裤子",
+              "裤子0",
+              "腿环",
+              "发饰",
+              "鞋子",
+              "鞋子饰",
+              "shirt",
+              "shoes",
+              "shorts",
+              "trigger",
+              "dress",
+              "hair_accessory",
+              "cloth01_shoes"
+            ],
+            stockings: ["袜子", "stockings"],
+            metal: ["metal01","earring"],
+          })
+
+          engine.addGround({ diffuseColor: new Vec3(0.05, 0.04, 0.06) })
         } catch {
           setEngineError(`Add model at public${MODEL_PATH}`)
         }
