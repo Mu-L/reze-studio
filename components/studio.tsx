@@ -418,18 +418,23 @@ export function StudioPage() {
   const [pmxPickSelected, setPmxPickSelected] = useState("")
   /** Radix menubar: which submenu is open (`""` = all closed). */
   const [menubarValue, setMenubarValue] = useState("")
-  /** After the menu closes Radix returns focus to the MenubarTrigger, so a
-   *  stray Space (the user's play/pause reflex) re-opens the File menu or
-   *  re-activates "New". Drop focus once the menu is fully closed. */
-  const handleMenubarValueChange = useCallback((v: string) => {
-    setMenubarValue(v)
-    if (v === "") {
-      requestAnimationFrame(() => {
-        const el = document.activeElement as HTMLElement | null
-        if (el && typeof el.blur === "function") el.blur()
-      })
-    }
+  /** After a File menu action fires, Radix returns focus to the `File` trigger.
+   *  A subsequent Space (the user's play/pause reflex) then re-opens the menu
+   *  or re-activates the last item ("New" wipes the clip). Drop focus whenever
+   *  a menu action completes — on close itself, and again at the end of each
+   *  async file handler (native file dialogs steal focus during the await, so
+   *  the rAF-on-close blur can't catch the post-dialog focus restore). */
+  const blurActiveElement = useCallback(() => {
+    const el = document.activeElement as HTMLElement | null
+    if (el && el !== document.body && typeof el.blur === "function") el.blur()
   }, [])
+  const handleMenubarValueChange = useCallback(
+    (v: string) => {
+      setMenubarValue(v)
+      if (v === "") requestAnimationFrame(blurActiveElement)
+    },
+    [blurActiveElement],
+  )
   /** Status bar push actions — footer subscribes to its own store so these
    *  writes do not re-render the page. */
   const { setPmxFileName: setStatusPmxFileName } = useStudioStatusActions()
@@ -686,7 +691,20 @@ export function StudioPage() {
     const boneTracks = new Map(clip.boneTracks)
     boneTracks.set(selectedBone, reduced)
     setSelectedKeyframes([])
-    commit({ ...clip, boneTracks })
+    const nextClip = { ...clip, boneTracks }
+    commit(nextClip)
+    // Pre-warm: walk the playhead through every frame once so V8 JITs the
+    // freshly-fitted bezier handles and the engine populates any per-segment
+    // caches up front. Without this, the first playback through a region
+    // stutters while those happen lazily on the rAF clock; replay is fine.
+    const model = modelRef.current
+    const engine = engineRef.current
+    if (model && engine) {
+      model.loadClip(STUDIO_ANIM_NAME, nextClip)
+      const total = nextClip.frameCount
+      for (let f = 0; f <= total; f++) model.seek(f / 30)
+      engine.resetPhysics()
+    }
   }, [clip, selectedBone, commit, setSelectedKeyframes])
 
   const clearSelectedBoneTrack = useCallback(() => {
@@ -838,9 +856,10 @@ export function StudioPage() {
         }
       } finally {
         setMenubarValue("")
+        blurActiveElement()
       }
     },
-    [loadPmxFromFolder],
+    [loadPmxFromFolder, blurActiveElement],
   )
 
   const onConfirmPmxPick = useCallback(async () => {
@@ -879,9 +898,10 @@ export function StudioPage() {
         window.alert(err instanceof Error ? err.message : String(err))
       } finally {
         URL.revokeObjectURL(url)
+        blurActiveElement()
       }
     },
-    [syncStudioAfterNewClip, replaceClip, setClipDisplayName],
+    [syncStudioAfterNewClip, replaceClip, setClipDisplayName, blurActiveElement],
   )
 
   const exportClipVmd = useCallback(() => {
@@ -916,7 +936,8 @@ export function StudioPage() {
     setClipVersion((v) => v + 1)
     model.show(STUDIO_ANIM_NAME)
     model.seek(0)
-  }, [replaceClip, setClipDisplayName, setSelectedBone, setSelectedMorph, setSelectedKeyframes, setCurrentFrame, setPlaying])
+    blurActiveElement()
+  }, [replaceClip, setClipDisplayName, setSelectedBone, setSelectedMorph, setSelectedKeyframes, setCurrentFrame, setPlaying, blurActiveElement])
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden text-foreground">

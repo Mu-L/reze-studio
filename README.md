@@ -133,7 +133,15 @@ The three high-frequency interactions (playback, keyframe drag, pose slider drag
 
 ### Simplify track (keyframe reduction)
 
-MMD's interpolation model makes classic Ramer–Douglas–Peucker awkward: each frame stores a whole-row record, rotation is one quaternion governed by a single bezier (so rotX/rotY/rotZ share a segment, not independent curves), and translation has three independent per-axis beziers. Reze Studio's simplifier therefore works at the _keyframe_ level, not the channel level: for each candidate key it evaluates whether removing it leaves the reconstructed pose within `2.0°` of geodesic rotation error and `0.02` units of translation error against a dense pre-computed sample of the _original_ track (not the running simplified track — that would let drift compound into visible differences). The pass is iterative and greedy, re-sampling between the surviving neighbours each time. The whole operation lands as one `commit()`, so a simplification is one undo step.
+MMD's interpolation model makes classic Ramer–Douglas–Peucker awkward: each frame stores a whole-row record, rotation is one quaternion governed by a single bezier shaping a slerp-t (so rotX/rotY/rotZ share a segment, not independent curves), and translation has three independent per-axis beziers. Reze Studio uses a **Schneider-style top-down fit** native to that model rather than dropping keys one at a time:
+
+1. Densely sample the original track at every integer frame across `[first, last]`.
+2. Try to fit one VMD segment over the whole span — four independent beziers (rotation slerp-t + tX/tY/tZ). For each, seed handles from endpoint-velocity matching against the dense samples, then refine with a coarse 5⁴ grid in 127-space + a local 5⁴ pass around the winner.
+3. If max pointwise error ≤ ε (geodesic angle for rotation, per-axis for translation), emit one keyframe and collapse every intermediate key.
+4. Otherwise split at the original key nearest the worst-deviation frame and recurse on both halves.
+5. Adjacent original keys are kept verbatim, including their authored interpolation.
+
+The earlier greedy "drop if tolerated" pass had a subtle failure: dropping a key inherited the surviving key's bezier handles, which were authored for a shorter segment — stretching them across a longer span warped the velocity profile and produced visible jitter even with tight pointwise ε. Custom-fitting per emitted segment removes that. Fixed tolerances `0.5°` / `0.01` units, no user knob. The whole operation lands as one `commit()`, so a simplification is one undo step.
 
 ### Where each piece lives
 

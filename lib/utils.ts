@@ -169,21 +169,26 @@ export function cloneAnimationClip(clip: AnimationClip): AnimationClip {
   return { ...clip, boneTracks, morphTracks }
 }
 
-// ─── Bone-track keyframe reduction ───────────────────────────────────────
-// Iterative greedy "remove if tolerated" pass. For each interior key we
-// reconstruct the track without it and measure max deviation vs the *original*
-// densely-sampled track across every integer frame in the affected span. If
-// rotation angle and per-axis translation both stay under the fixed thresholds,
-// drop the key. Repeats until no key can be dropped. First and last keys are
-// always kept.
+// ─── Bone-track keyframe reduction (Schneider-style VMD-native fitting) ─
+// Top-down: try to fit a single VMD segment over the whole [first, last]
+// span — four independent beziers (one rotation slerp-t curve, three
+// per-axis translation curves). If the fitted curves stay within ε of the
+// densely-sampled original at every integer frame, emit one keyframe and
+// collapse every intermediate key. Otherwise split at the original key
+// nearest the worst-deviation frame and recurse on both halves. First and
+// last keys are always kept.
 //
-// Comparing against original samples (rather than the running, partially
-// simplified track) bounds total drift to ε per channel — drops never
-// compound, so we can run looser tolerances without visual change.
+// Each fit is a 4D problem in 127-space (handle x1,y1,x2,y2): seed handles
+// from endpoint-velocity matching against the dense original samples, then
+// coarse grid search + local refinement. The previous greedy "drop if
+// tolerated" pass inherited the surviving key's bezier handles — those
+// handles were authored for a shorter segment, so stretching them over a
+// longer one warped the velocity profile and produced visible jitter even
+// with tight pointwise ε. Custom-fitting per emitted segment removes that.
 //
 // Fixed tolerances (no user knob by design):
-export const SIMPLIFY_ROT_DEG = 1.0 // visible-but-tiny rotation drift
-export const SIMPLIFY_TRANS = 0.02 // MMD units (~3mm at character scale)
+export const SIMPLIFY_ROT_DEG = 0.5 // visible-but-tiny rotation drift
+export const SIMPLIFY_TRANS = 0.01 // MMD units (~3mm at character scale)
 
 const INV_127 = 1 / 127
 
@@ -248,15 +253,277 @@ function quatAngleDegrees(a: Quat, b: Quat): number {
   return 2 * Math.acos(clamped) * (180 / Math.PI)
 }
 
+// Coarse pass over the 4D handle space, then a tight local refinement
+// around the coarse winner. 5⁴ + 5⁴ = 1250 evals per channel — cheap, and
+// the seed (from endpoint-velocity matching) usually puts us in the right
+// basin so the coarse grid is mostly insurance against slope estimates
+// being off (e.g. when the second sample is anomalous).
+const COARSE_HANDLES = [0, 32, 64, 96, 127]
+const REFINE_DELTAS = [-16, -8, 0, 8, 16]
+
+function clamp127(v: number): number {
+  return v < 0 ? 0 : v > 127 ? 127 : v
+}
+
+function fitBezierHandles(evalErr: (cp: ControlPoint[]) => number, seed: ControlPoint[]): ControlPoint[] {
+  let bestCP = seed
+  let bestErr = evalErr(seed)
+  for (const x1 of COARSE_HANDLES)
+    for (const y1 of COARSE_HANDLES)
+      for (const x2 of COARSE_HANDLES)
+        for (const y2 of COARSE_HANDLES) {
+          const cp: ControlPoint[] = [
+            { x: x1, y: y1 },
+            { x: x2, y: y2 },
+          ]
+          const err = evalErr(cp)
+          if (err < bestErr) {
+            bestErr = err
+            bestCP = cp
+          }
+        }
+  const cx1 = bestCP[0].x
+  const cy1 = bestCP[0].y
+  const cx2 = bestCP[1].x
+  const cy2 = bestCP[1].y
+  for (const dx1 of REFINE_DELTAS)
+    for (const dy1 of REFINE_DELTAS)
+      for (const dx2 of REFINE_DELTAS)
+        for (const dy2 of REFINE_DELTAS) {
+          if (dx1 === 0 && dy1 === 0 && dx2 === 0 && dy2 === 0) continue
+          const cp: ControlPoint[] = [
+            { x: clamp127(cx1 + dx1), y: clamp127(cy1 + dy1) },
+            { x: clamp127(cx2 + dx2), y: clamp127(cy2 + dy2) },
+          ]
+          const err = evalErr(cp)
+          if (err < bestErr) {
+            bestErr = err
+            bestCP = cp
+          }
+        }
+  return bestCP
+}
+
+// Pick handle y's so the curve hugs the desired endpoint slopes. x1=42, x2=85
+// (roughly the canonical 1/3, 2/3 cubic positions); y solves dy/dx = slope at
+// the endpoints. Slopes outside [0, ~3] just clamp to the boundary — the grid
+// search recovers detail from there.
+function seedBezierFromSlopes(slope0: number, slope1: number): ControlPoint[] {
+  const X1 = 42
+  const X2 = 85
+  return [
+    { x: X1, y: clamp127(Math.round(slope0 * X1)) },
+    { x: X2, y: clamp127(Math.round(127 - slope1 * (127 - X2))) },
+  ]
+}
+
+function fitRotationBezier(
+  kA: BoneKeyframe,
+  kC: BoneKeyframe,
+  originalRot: Quat[],
+  fA: number,
+  fC: number,
+  f0: number,
+  span: number,
+  rotTotalDeg: number,
+): ControlPoint[] {
+  const fNext = fA + 1 <= fC ? fA + 1 : fC
+  const fBeforeEnd = fC - 1 >= fA ? fC - 1 : fA
+  const angleAtNext = quatAngleDegrees(kA.rotation, originalRot[fNext - f0])
+  const angleBeforeEnd = quatAngleDegrees(kA.rotation, originalRot[fBeforeEnd - f0])
+  const s0 = (angleAtNext / rotTotalDeg) * span
+  const s1 = ((rotTotalDeg - angleBeforeEnd) / rotTotalDeg) * span
+  const seed = seedBezierFromSlopes(s0, s1)
+  const evalErr = (cp: ControlPoint[]): number => {
+    let maxErr = 0
+    for (let f = fA; f <= fC; f++) {
+      const u = (f - fA) / span
+      const t = bezierY(cp, u)
+      const q = Quat.slerp(kA.rotation, kC.rotation, t)
+      const err = quatAngleDegrees(q, originalRot[f - f0])
+      if (err > maxErr) maxErr = err
+    }
+    return maxErr
+  }
+  return fitBezierHandles(evalErr, seed)
+}
+
+function fitAxisBezier(
+  startVal: number,
+  endVal: number,
+  originalTr: Vec3[],
+  axis: "x" | "y" | "z",
+  fA: number,
+  fC: number,
+  f0: number,
+  span: number,
+): ControlPoint[] {
+  const range = endVal - startVal
+  const get = (f: number): number => {
+    const v = originalTr[f - f0]
+    return axis === "x" ? v.x : axis === "y" ? v.y : v.z
+  }
+  const fNext = fA + 1 <= fC ? fA + 1 : fC
+  const fBeforeEnd = fC - 1 >= fA ? fC - 1 : fA
+  const s0 = ((get(fNext) - startVal) / range) * span
+  const s1 = ((endVal - get(fBeforeEnd)) / range) * span
+  const seed = seedBezierFromSlopes(s0, s1)
+  const evalErr = (cp: ControlPoint[]): number => {
+    let maxErr = 0
+    for (let f = fA; f <= fC; f++) {
+      const u = (f - fA) / span
+      const t = bezierY(cp, u)
+      const val = startVal + range * t
+      const err = Math.abs(val - get(f))
+      if (err > maxErr) maxErr = err
+    }
+    return maxErr
+  }
+  return fitBezierHandles(evalErr, seed)
+}
+
+interface SegmentFit {
+  interpolation: BoneInterpolation
+  maxRotErrDeg: number
+  maxTrErr: number
+  worstFrame: number
+}
+
+// Fit a single VMD segment (4 beziers) collapsing all original keys strictly
+// between kA and kC. Returns the fit + the frame at which combined error is
+// worst, used by the recursion to pick a split point if the fit fails.
+function fitBezierSegment(
+  kA: BoneKeyframe,
+  kC: BoneKeyframe,
+  originalRot: Quat[],
+  originalTr: Vec3[],
+  f0: number,
+  epsRotDeg: number,
+  epsTrans: number,
+): SegmentFit {
+  const fA = kA.frame
+  const fC = kC.frame
+  const span = fC - fA
+  const rotTotalDeg = quatAngleDegrees(kA.rotation, kC.rotation)
+  const rangeX = kC.translation.x - kA.translation.x
+  const rangeY = kC.translation.y - kA.translation.y
+  const rangeZ = kC.translation.z - kA.translation.z
+  // For channels with negligible range the bezier is a no-op (output stays
+  // ~constant at start ≈ end), so just pick the linear default — fitting
+  // would be searching for a curve that scales a zero range.
+  const linearRot = VMD_LINEAR_DEFAULT_IP.rotation
+  const linearTX = VMD_LINEAR_DEFAULT_IP.translationX
+  const linearTY = VMD_LINEAR_DEFAULT_IP.translationY
+  const linearTZ = VMD_LINEAR_DEFAULT_IP.translationZ
+  const rotCP =
+    rotTotalDeg < 1e-4
+      ? linearRot.map((p) => ({ x: p.x, y: p.y }))
+      : fitRotationBezier(kA, kC, originalRot, fA, fC, f0, span, rotTotalDeg)
+  const txCP =
+    Math.abs(rangeX) < 1e-4
+      ? linearTX.map((p) => ({ x: p.x, y: p.y }))
+      : fitAxisBezier(kA.translation.x, kC.translation.x, originalTr, "x", fA, fC, f0, span)
+  const tyCP =
+    Math.abs(rangeY) < 1e-4
+      ? linearTY.map((p) => ({ x: p.x, y: p.y }))
+      : fitAxisBezier(kA.translation.y, kC.translation.y, originalTr, "y", fA, fC, f0, span)
+  const tzCP =
+    Math.abs(rangeZ) < 1e-4
+      ? linearTZ.map((p) => ({ x: p.x, y: p.y }))
+      : fitAxisBezier(kA.translation.z, kC.translation.z, originalTr, "z", fA, fC, f0, span)
+
+  let maxRotErrDeg = 0
+  let maxTrErr = 0
+  let worstFrame = fA
+  let worstScore = -1
+  const epsRotInv = 1 / Math.max(epsRotDeg, 1e-6)
+  const epsTrInv = 1 / Math.max(epsTrans, 1e-6)
+  for (let f = fA; f <= fC; f++) {
+    const u = span > 0 ? (f - fA) / span : 0
+    const rotT = rotTotalDeg < 1e-4 ? u : bezierY(rotCP, u)
+    const q = Quat.slerp(kA.rotation, kC.rotation, rotT)
+    const rErr = quatAngleDegrees(q, originalRot[f - f0])
+    const txT = Math.abs(rangeX) < 1e-4 ? u : bezierY(txCP, u)
+    const tyT = Math.abs(rangeY) < 1e-4 ? u : bezierY(tyCP, u)
+    const tzT = Math.abs(rangeZ) < 1e-4 ? u : bezierY(tzCP, u)
+    const ot = originalTr[f - f0]
+    const tErr = Math.max(
+      Math.abs(kA.translation.x + rangeX * txT - ot.x),
+      Math.abs(kA.translation.y + rangeY * tyT - ot.y),
+      Math.abs(kA.translation.z + rangeZ * tzT - ot.z),
+    )
+    if (rErr > maxRotErrDeg) maxRotErrDeg = rErr
+    if (tErr > maxTrErr) maxTrErr = tErr
+    const score = Math.max(rErr * epsRotInv, tErr * epsTrInv)
+    if (score > worstScore) {
+      worstScore = score
+      worstFrame = f
+    }
+  }
+  return {
+    interpolation: { rotation: rotCP, translationX: txCP, translationY: tyCP, translationZ: tzCP },
+    maxRotErrDeg,
+    maxTrErr,
+    worstFrame,
+  }
+}
+
+function fitRecursive(
+  track: BoneKeyframe[],
+  startIdx: number,
+  endIdx: number,
+  originalRot: Quat[],
+  originalTr: Vec3[],
+  f0: number,
+  epsRotDeg: number,
+  epsTrans: number,
+  result: BoneKeyframe[],
+): void {
+  const kA = track[startIdx]
+  const kC = track[endIdx]
+  // Adjacent original keys — nothing to collapse, keep kC's authored curves.
+  if (endIdx - startIdx === 1) {
+    result.push({
+      boneName: kC.boneName,
+      frame: kC.frame,
+      rotation: kC.rotation,
+      translation: kC.translation,
+      interpolation: cloneBoneInterpolation(kC.interpolation),
+    })
+    return
+  }
+  const fit = fitBezierSegment(kA, kC, originalRot, originalTr, f0, epsRotDeg, epsTrans)
+  if (fit.maxRotErrDeg <= epsRotDeg && fit.maxTrErr <= epsTrans) {
+    result.push({
+      boneName: kC.boneName,
+      frame: kC.frame,
+      rotation: kC.rotation,
+      translation: kC.translation,
+      interpolation: fit.interpolation,
+    })
+    return
+  }
+  // Split at the original key nearest the worst-deviation frame. Tie-break by
+  // first-found which favors the earlier half.
+  let splitIdx = startIdx + 1
+  let bestDist = Math.abs(track[splitIdx].frame - fit.worstFrame)
+  for (let i = startIdx + 2; i < endIdx; i++) {
+    const d = Math.abs(track[i].frame - fit.worstFrame)
+    if (d < bestDist) {
+      bestDist = d
+      splitIdx = i
+    }
+  }
+  fitRecursive(track, startIdx, splitIdx, originalRot, originalTr, f0, epsRotDeg, epsTrans, result)
+  fitRecursive(track, splitIdx, endIdx, originalRot, originalTr, f0, epsRotDeg, epsTrans, result)
+}
+
 export function simplifyBoneTrack(
   track: BoneKeyframe[],
   epsRotDeg: number = SIMPLIFY_ROT_DEG,
   epsTrans: number = SIMPLIFY_TRANS,
 ): BoneKeyframe[] {
   if (track.length <= 2) return track
-  // Sample the original track once per integer frame across its full span.
-  // First and last keys are never removed, so `cur` always spans [f0, fN]
-  // and indexing into these arrays by `f - f0` stays valid.
   const f0 = track[0].frame
   const fN = track[track.length - 1].frame
   const originalRot: Quat[] = new Array(fN - f0 + 1)
@@ -266,42 +533,15 @@ export function simplifyBoneTrack(
     originalRot[f - f0] = s.rotation
     originalTr[f - f0] = s.translation
   }
-  const cur = [...track]
-  // Each pass removes at most one key then restarts so neighbor relationships
-  // stay consistent. O(n² × span) but n is small in practice.
-  for (;;) {
-    let dropped = false
-    for (let i = 1; i < cur.length - 1; i++) {
-      const prev = cur[i - 1]
-      const next = cur[i + 1]
-      const a = prev.frame
-      const b = next.frame
-      if (b <= a) continue
-      const without = [prev, next]
-      let maxRot = 0
-      let maxTr = 0
-      for (let f = a; f <= b; f++) {
-        const r = evalBoneTrackAt(without, f)
-        const idx = f - f0
-        const oRot = originalRot[idx]
-        const oTr = originalTr[idx]
-        const rotErr = quatAngleDegrees(oRot, r.rotation)
-        const trErr = Math.max(
-          Math.abs(oTr.x - r.translation.x),
-          Math.abs(oTr.y - r.translation.y),
-          Math.abs(oTr.z - r.translation.z),
-        )
-        if (rotErr > maxRot) maxRot = rotErr
-        if (trErr > maxTr) maxTr = trErr
-        if (maxRot > epsRotDeg || maxTr > epsTrans) break
-      }
-      if (maxRot <= epsRotDeg && maxTr <= epsTrans) {
-        cur.splice(i, 1)
-        dropped = true
-        break
-      }
-    }
-    if (!dropped) break
-  }
-  return cur
+  const result: BoneKeyframe[] = [
+    {
+      boneName: track[0].boneName,
+      frame: track[0].frame,
+      rotation: track[0].rotation,
+      translation: track[0].translation,
+      interpolation: cloneBoneInterpolation(track[0].interpolation),
+    },
+  ]
+  fitRecursive(track, 0, track.length - 1, originalRot, originalTr, f0, epsRotDeg, epsTrans, result)
+  return result
 }
